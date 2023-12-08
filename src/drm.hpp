@@ -40,13 +40,13 @@ extern "C" {
 
 #include "rendervulkan.hpp"
 
-#include <unordered_map>
 #include <utility>
 #include <atomic>
 #include <map>
 #include <unordered_map>
 #include <mutex>
 #include <vector>
+#include <string>
 
 struct saved_mode {
 	int width;

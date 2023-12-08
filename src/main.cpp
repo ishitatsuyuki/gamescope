@@ -4,6 +4,7 @@
 #include <thread>
 #include <mutex>
 #include <vector>
+#include <string>
 #include <cstring>
 #include <sys/capability.h>
 #include <sys/stat.h>
