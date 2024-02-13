@@ -2710,7 +2710,7 @@ static void present_wait_thread_func( void )
 			{
 				g_device.vk.WaitForPresentKHR( g_device.device(), g_output.swapChain, present_wait_id, 1'000'000'000lu );
 				uint64_t vblanktime = get_time_in_nanos();
-				GetVBlankTimer().MarkVBlank( vblanktime, true );
+				GetVBlankTimer().MarkVBlank( vblanktime );
 				mangoapp_output_update( vblanktime );
 			}
 		}

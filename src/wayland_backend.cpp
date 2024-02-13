@@ -700,7 +700,7 @@ namespace gamescope
             }
         }
 
-        GetVBlankTimer().MarkVBlank( ulTime, true );
+        GetVBlankTimer().MarkVBlank( ulTime );
         wp_presentation_feedback_destroy( pFeedback );
     }
     void CWaylandPlane::Wayland_PresentationFeedback_Discarded( struct wp_presentation_feedback *pFeedback )

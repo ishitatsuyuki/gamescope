@@ -856,13 +856,7 @@ Window x11_win(steamcompmgr_win_t *w) {
 	return w->xwayland().id;
 }
 
-struct global_focus_t : public focus_t
-{
-	steamcompmgr_win_t	  	 		*keyboardFocusWindow;
-	steamcompmgr_win_t	  	 		*fadeWindow;
-	MouseCursor		*cursor;
-} global_focus;
-
+global_focus_t global_focus;
 
 uint32_t		currentOutputWidth, currentOutputHeight;
 bool			currentHDROutput = false;
@@ -1099,7 +1093,7 @@ namespace gamescope
 }
 
 
-static std::atomic<bool> g_bForceRepaint{false};
+std::atomic<bool> g_bForceRepaint{false};
 
 extern int g_nCursorScaleHeight;
 
@@ -2401,7 +2395,7 @@ paint_window(steamcompmgr_win_t *w, steamcompmgr_win_t *scaleW, struct FrameInfo
 
 bool g_bFirstFrame = true;
 
-static bool is_fading_out()
+bool is_fading_out()
 {
 	return fadeOutStartTime || g_bPendingFade;
 }
@@ -2417,7 +2411,7 @@ static void update_touch_scaling( const struct FrameInfo_t *frameInfo )
 	focusedWindowOffsetY = frameInfo->layers[ frameInfo->layerCount - 1 ].offset.y;
 }
 
-static void
+bool
 paint_all(bool async)
 {
 	gamescope_xwayland_server_t *root_server = wlserver_get_xwayland_server(0);
@@ -2578,7 +2572,7 @@ paint_all(bool async)
 		if ( overlay == global_focus.inputFocusWindow )
 			update_touch_scaling( &frameInfo );
 	}
-	else if ( !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
+	else if ( false && !GetBackend()->UsesVulkanSwapchain() && GetBackend()->IsSessionBased() )
 	{
 		auto tex = vulkan_get_hacky_blank_texture();
 		if ( tex != nullptr )
@@ -2634,7 +2628,7 @@ paint_all(bool async)
 
 	if ( !bValidContents || !GetBackend()->IsVisible() )
 	{
-		return;
+		return false;
 	}
 
 	unsigned int blurFadeTime = get_time_in_milliseconds() - g_BlurFadeStartTime;
@@ -2722,7 +2716,7 @@ paint_all(bool async)
 
 	if ( GetBackend()->Present( &frameInfo, async ) != 0 )
 	{
-		return;
+		return false;
 	}
 
 #if HAVE_PIPEWIRE
@@ -2863,7 +2857,7 @@ paint_all(bool async)
 			if ( !oScreenshotSeq )
 			{
 				xwm_log.errorf("vulkan_screenshot failed");
-				return;
+				return false;
 			}
 
 			vulkan_wait( *oScreenshotSeq, false );
@@ -3084,6 +3078,7 @@ paint_all(bool async)
 
 	gpuvis_trace_end_ctx_printf( paintID, "paint_all" );
 	gpuvis_trace_printf( "paint_all %i layers", (int)frameInfo.layerCount );
+	return true;
 }
 
 /* Get prop from window
@@ -7548,7 +7543,6 @@ steamcompmgr_main(int argc, char **argv)
 
 	bool vblank = false;
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
-	GetVBlankTimer().ArmNextVBlank( true );
 
 	{
 		gamescope_xwayland_server_t *pServer = NULL;
@@ -7582,10 +7576,10 @@ steamcompmgr_main(int argc, char **argv)
 	// ie. color.rgb = color.rgba * u_ctm[offsetLayerIdx];
 	s_scRGB709To2020Matrix = GetBackend()->CreateBackendBlob( glm::mat3x4( glm::transpose( k_2020_from_709 ) ) );
 
+	gamescope::FlipManager commitFSM;
+
 	for (;;)
 	{
-		vblank = false;
-
 		{
 			gamescope_xwayland_server_t *server = NULL;
 			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
@@ -7597,12 +7591,6 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		g_SteamCompMgrWaiter.PollEvents();
-
-		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )
-		{
-			g_SteamCompMgrVBlankTime = *pendingVBlank;
-			vblank = true;
-		}
 
 		if ( g_bRun == false )
 		{
@@ -7706,88 +7694,10 @@ steamcompmgr_main(int argc, char **argv)
 #endif
 		}
 
-		// Ask for a new surface every vblank
-		// When we observe a new commit being complete for a surface, we ask for a new frame.
-		// This ensures that FIFO works properly, since otherwise we might ask for a new frame
-		// application can commit a new frame that completes before we ever displayed
-		// the current pending commit.
-		static uint64_t vblank_idx = 0;
-		if ( vblank == true )
+		if ( std::optional<gamescope::VBlankTime> pendingVBlank = GetVBlankTimer().ProcessVBlank() )
 		{
-			{
-				gamescope_xwayland_server_t *server = NULL;
-				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				{
-					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
-					{
-						steamcompmgr_latch_frame_done( w, vblank_idx );
-					}
-				}
-
-				for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
-				{
-					steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx );
-				}
-			}
-		}
-
-		{
-			gamescope_xwayland_server_t *server = NULL;
-			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-			{
-				handle_done_commits_xwayland(server->ctx.get(), vblank, vblank_idx);
-
-				// When we have observed both a complete commit and a VBlank, we should request a new frame.
-				if (vblank)
-				{
-					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
-					{
-						steamcompmgr_flush_frame_done(w);
-					}
-				}
-			}
-		}
-
-		if ( vblank )
-		{
-			vblank_idx++;
-
-			int nRealRefresh = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
-			int nTargetFPS = g_nSteamCompMgrTargetFPS ? g_nSteamCompMgrTargetFPS : nRealRefresh;
-			nTargetFPS = std::min<int>( nTargetFPS, nRealRefresh );
-			int nVblankDivisor = nRealRefresh / nTargetFPS;
-
-			g_SteamCompMgrAppRefreshCycle = 1'000'000'000ul / nRealRefresh;
-			g_SteamCompMgrLimitedAppRefreshCycle = 1'000'000'000ul / nRealRefresh * nVblankDivisor;
-		}
-
-		// Handle presentation-time stuff
-		//
-		// Notes:
-		//
-		// We send the presented event just after the latest latch time possible so PresentWait in Vulkan
-		// still returns pretty optimally. The extra 2ms or so can be "display latency"
-		// We still provide the predicted TTL refresh time in the presented event though.
-		//
-		// We ignore or lie most of the flags because they aren't particularly useful for a client
-		// to know anyway and it would delay us sending this at an optimal time.
-		// (particularly for DXGI frame latency handles under Proton.)
-		//
-		// The boat is still out as to whether we should do latest latch or pageflip/ttl for the event.
-		// For now, going to keep this, and if we change our minds later, it's no big deal.
-		//
-		// It's a little strange, but we return `presented` for any window not visible
-		// and `presented` for anything visible. It's a little disingenuous because we didn't
-		// actually show a window if it wasn't visible, but we could! And that is the first
-		// opportunity it had. It's confusing but we need this for forward progress.
-
-		if ( vblank )
-		{
-			wlserver_lock();
-			gamescope_xwayland_server_t *server = NULL;
-			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				handle_presented_xwayland( server->ctx.get() );
-			wlserver_unlock();
+			g_SteamCompMgrVBlankTime = *pendingVBlank;
+			commitFSM.NotifyLatch();
 		}
 
 		//
@@ -7872,66 +7782,95 @@ steamcompmgr_main(int argc, char **argv)
 		if ( is_fading_out() )
 			hasRepaint = true;
 
-		static int nIgnoredOverlayRepaints = 0;
-
-		const bool bVRR = GetBackend()->IsVRRActive();
-
-		// HACK: Disable tearing if we have an overlay to avoid stutters right now
-		// TODO: Fix properly.
-		static bool bHasOverlay = ( global_focus.overlayWindow && global_focus.overlayWindow->opacity ) ||
-								( global_focus.externalOverlayWindow && global_focus.externalOverlayWindow->opacity ) ||
-								( global_focus.overrideWindow  && global_focus.focusWindow && !global_focus.focusWindow->isSteamStreamingClient && global_focus.overrideWindow->opacity );
-
-		const bool bSteamOverlayOpen  = global_focus.overlayWindow && global_focus.overlayWindow->opacity;
-		// If we are running behind, allow tearing.
-		const bool bSurfaceWantsAsync = (g_HeldCommits[HELD_COMMIT_BASE] && g_HeldCommits[HELD_COMMIT_BASE]->async);
-
-		const bool bForceRepaint = g_bForceRepaint.exchange(false);
-		const bool bForceSyncFlip = bForceRepaint || is_fading_out();
-		// If we are compositing, always force sync flips because we currently wait
-		// for composition to finish before submitting.
-		// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
-		const bool bNeedsSyncFlip = bForceSyncFlip || GetVBlankTimer().WasCompositing() || nIgnoredOverlayRepaints;
-		const bool bDoAsyncFlip   = ( ((g_nAsyncFlipsEnabled >= 1) && GetBackend()->SupportsTearing() && bSurfaceWantsAsync && !bHasOverlay) || bVRR ) && !bSteamOverlayOpen && !bNeedsSyncFlip;
-
-		bool bShouldPaint = false;
-		if ( bDoAsyncFlip )
+		if (hasRepaint)
 		{
-			if ( hasRepaint && !GetVBlankTimer().WasCompositing() )
-				bShouldPaint = true;
-		}
-		else
-		{
-			bShouldPaint = vblank && ( hasRepaint || hasRepaintNonBasePlane || bForceSyncFlip );
+			commitFSM.NotifyNewBuffer( g_HeldCommits[HELD_COMMIT_BASE] && g_HeldCommits[HELD_COMMIT_BASE]->async);
 		}
 
-		// If we have a pending page flip and doing VRR, lets not do another...
-		if ( bVRR && GetBackend()->PresentationFeedback().CurrentPresentsInFlight() != 0 )
-			bShouldPaint = false;
+		bool sendCompletion = commitFSM.Update();
 
-		if ( !bShouldPaint && hasRepaintNonBasePlane && vblank )
-			nIgnoredOverlayRepaints++;
-
-		if ( !GetBackend()->IsVisible() )
-			bShouldPaint = false;
-
-		if ( bShouldPaint )
+		// Ask for a new surface every vblank
+		// When we observe a new commit being complete for a surface, we ask for a new frame.
+		// This ensures that FIFO works properly, since otherwise we might ask for a new frame
+		// application can commit a new frame that completes before we ever displayed
+		// the current pending commit.
+		static uint64_t vblank_idx = 0;
+		if ( sendCompletion == true )
 		{
-			paint_all( !vblank && !bVRR );
+			{
+				gamescope_xwayland_server_t *server = NULL;
+				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+				{
+					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
+					{
+						steamcompmgr_latch_frame_done( w, vblank_idx );
+					}
+				}
 
-			hasRepaint = false;
-			hasRepaintNonBasePlane = false;
-			nIgnoredOverlayRepaints = 0;
+				for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
+				{
+					steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx );
+				}
+			}
 		}
 
-		if ( vblank )
 		{
-			// Pre-emptively re-arm the vblank timer if it
-			// isn't already re-armed.
-			//
-			// Juuust in case pageflip handler doesn't happen
-			// so we don't stop vblanking forever.
-			GetVBlankTimer().ArmNextVBlank( true );
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+			{
+				handle_done_commits_xwayland(server->ctx.get(), sendCompletion, vblank_idx);
+
+				// When we have observed both a complete commit and a VBlank, we should request a new frame.
+				if (sendCompletion)
+				{
+					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
+					{
+						steamcompmgr_flush_frame_done(w);
+					}
+				}
+			}
+		}
+
+		if ( sendCompletion )
+		{
+			vblank_idx++;
+
+			int nRealRefresh = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
+			int nTargetFPS = g_nSteamCompMgrTargetFPS ? g_nSteamCompMgrTargetFPS : nRealRefresh;
+			nTargetFPS = std::min<int>( nTargetFPS, nRealRefresh );
+			int nVblankDivisor = nRealRefresh / nTargetFPS;
+
+			g_SteamCompMgrAppRefreshCycle = 1'000'000'000ul / nRealRefresh;
+			g_SteamCompMgrLimitedAppRefreshCycle = 1'000'000'000ul / nRealRefresh * nVblankDivisor;
+		}
+
+		// Handle presentation-time stuff
+		//
+		// Notes:
+		//
+		// We send the presented event just after the latest latch time possible so PresentWait in Vulkan
+		// still returns pretty optimally. The extra 2ms or so can be "display latency"
+		// We still provide the predicted TTL refresh time in the presented event though.
+		//
+		// We ignore or lie most of the flags because they aren't particularly useful for a client
+		// to know anyway and it would delay us sending this at an optimal time.
+		// (particularly for DXGI frame latency handles under Proton.)
+		//
+		// The boat is still out as to whether we should do latest latch or pageflip/ttl for the event.
+		// For now, going to keep this, and if we change our minds later, it's no big deal.
+		//
+		// It's a little strange, but we return `presented` for any window not visible
+		// and `presented` for anything visible. It's a little disingenuous because we didn't
+		// actually show a window if it wasn't visible, but we could! And that is the first
+		// opportunity it had. It's confusing but we need this for forward progress.
+
+		if ( sendCompletion )
+		{
+			wlserver_lock();
+			gamescope_xwayland_server_t *server = NULL;
+			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
+				handle_presented_xwayland( server->ctx.get() );
+			wlserver_unlock();
 		}
 
 		update_vrr_atoms(root_ctx, false, &flush_root);
@@ -7954,8 +7893,6 @@ steamcompmgr_main(int argc, char **argv)
 		}
 
 		vulkan_garbage_collect();
-
-		vblank = false;
 	}
 
 	steamcompmgr_exit();

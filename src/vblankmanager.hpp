@@ -47,16 +47,14 @@ namespace gamescope
         uint64_t GetNextVBlank( uint64_t ulOffset ) const;
 
         VBlankScheduleTime CalcNextWakeupTime( bool bPreemptive );
-        void Reschedule();
 
         std::optional<VBlankTime> ProcessVBlank();
-        void MarkVBlank( uint64_t ulNanos, bool bReArmTimer );
+        void MarkVBlank( uint64_t ulNanos );
 
         bool WasCompositing() const;
         void UpdateWasCompositing( bool bCompositing );
         void UpdateLastDrawTime( uint64_t ulNanos );
 
-        void WaitToBeArmed();
         void ArmNextVBlank( bool bPreemptive );
 
         bool UsingTimerFD() const;
@@ -128,9 +126,68 @@ namespace gamescope
         // 93% by default. (kDefaultVBlankRateOfDecayPercentage)
         uint64_t m_ulVBlankRateOfDecayPercentage = kDefaultVBlankRateOfDecayPercentage;
 
+        void WaitToBeArmed();
         void NudgeThread();
     };
+
+    enum class FlipManagerState {
+        WaitFlip,
+        WaitLatch,
+        Commitable,
+    };
+
+    // A state machine that decides when to perform a flip.
+    // It also manages when to send completion events, which happens at the time of latch if the
+    // mode uses latching, or after the flip it the mode is async.
+    //
+    // There are three modes of operation:
+    // 1. Sync, no VRR:
+    // - WaitFlip is the starting state after a flip is pending.
+    // - WaitLatch is entered when the flip is done, with the VSync timer armed.
+    // - Upon timer expiry, either a new flip is committed, or another latch timer is armed.
+    // 2. Sync, VRR:
+    // - WaitFlip is the starting state after a flip is pending.
+    // - WaitLatch is entered when the flip is done, with the VSync timer armed.
+    // - Upon timer expiry, a new flip is committed. If there is no new buffer, the state machine
+    //   transitions to Commitable, where any new buffer will be immediately flipped.
+    // 3. Async:
+    // - WaitFlip is the starting state after a flip is pending.
+    // - Upon flip done event, a new flip is committed. If there is no new buffer, the state machine
+    //   transitions to Commitable, where any new buffer will be immediately flipped.
+    // There are a number of important invariants for some states:
+    // - The state machine must enter the WaitFlip state upon a flip is pending, and must remain in the
+    //   WaitFlip state until the flip is done.
+    // - The state machine must enter the WaitLatch state upon arming a timer, and must remain in the
+    //   WaitLatch state until the timer expires.
+    //
+    // The state machine will also try to transition sensibly when a different mode is requested, while
+    // maintaining the invariants.
+    class FlipManager {
+    public:
+        FlipManager() {}
+
+        void NotifyLatch();
+        void NotifyNewBuffer(bool surfaceWantsAsync);
+
+        bool Update();
+    private:
+        bool TryFlip();
+        bool HasRepaint() const;
+        bool NextRepaintIsAsync() const;
+        bool HasLatch() const;
+        bool HasDoneFlip() const;
+        bool IsVRR() const;
+        bool HasForcedRepaint() const;
+        void TransitionWaitLatch();
+
+        FlipManagerState m_state = FlipManagerState::Commitable;
+        bool m_hasLatch = false;
+        bool m_hasBuffer = false;
+        bool m_bufferIsAsync = false;
+    };
 }
+
+extern std::atomic<bool> g_hasDoneFlip;
 
 gamescope::CVBlankTimer &GetVBlankTimer();
 

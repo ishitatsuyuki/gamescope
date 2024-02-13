@@ -641,7 +641,8 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 
 	// This is the last vblank time
 	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
-	GetVBlankTimer().MarkVBlank( vblanktime, true );
+	GetVBlankTimer().MarkVBlank( vblanktime );
+	g_hasDoneFlip = true;
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
@@ -3122,10 +3123,15 @@ namespace gamescope
 			if ( !bNeedsFullComposite && !bWantsPartialComposite )
 			{
 				int ret = drm_prepare( &g_DRM, bAsync, pFrameInfo );
+				if (ret != 0)
+					ret = drm_prepare( &g_DRM, false, pFrameInfo );
 				if ( ret == 0 )
 					bDoComposite = false;
 				else if ( ret == -EACCES )
+				{
+					g_hasDoneFlip = true;
 					return 0;
+				}
 			}
 
 			// Update to let the vblank manager know we are currently compositing.
@@ -3310,7 +3316,10 @@ namespace gamescope
 
 			// Happens when we're VT-switched away
 			if ( ret == -EACCES )
+			{
+				g_hasDoneFlip = true;
 				return 0;
+			}
 
 			if ( ret != 0 )
 			{
@@ -3320,28 +3329,49 @@ namespace gamescope
 					abort();
 				}
 
-				xwm_log.errorf("Failed to prepare 1-layer flip (%s), trying again with previous mode if modeset needed", strerror( -ret ));
-
-				// Try once again to in case we need to fall back to another mode.
-				ret = drm_prepare( &g_DRM, bAsync, &compositeFrameInfo );
-
-				// Happens when we're VT-switched away
-				if ( ret == -EACCES )
-					return 0;
-
-				if ( ret != 0 )
+				if (bAsync)
 				{
-					xwm_log.errorf("Failed to prepare 1-layer flip entirely: %s", strerror( -ret ));
-					// We should always handle a 1-layer flip, this used to abort,
-					// but lets be more friendly and just avoid a commit and try again later.
-					// Let's re-poll our state, and force grab the best connector again.
-					//
-					// Some intense connector hotplugging could be occuring and the
-					// connector could become destroyed before we had a chance to use it
-					// as we hadn't reffed it in a commit yet.
-					this->DirtyState( true, false );
-					this->PollState();
-					return ret;
+					xwm_log.errorf("Failed to prepare 1-layer flip (%s), trying again without async", strerror( -ret ));
+
+					// Try once again to in case we need to fall back to another mode.
+					ret = drm_prepare( &g_DRM, false, &presentCompFrameInfo );
+
+					// Happens when we're VT-switched away
+					if ( ret == -EACCES )
+					{
+						g_hasDoneFlip = true;
+						return 0;
+					}
+				}
+
+				if (ret != 0)
+				{
+					xwm_log.errorf("Failed to prepare 1-layer flip (%s), trying again with previous mode if modeset needed", strerror( -ret ));
+
+					// Try once again to in case we need to fall back to another mode.
+					ret = drm_prepare( &g_DRM, false, &compositeFrameInfo );
+
+					// Happens when we're VT-switched away
+					if ( ret == -EACCES )
+					{
+						g_hasDoneFlip = true;
+						return 0;
+					}
+
+					if ( ret != 0 )
+					{
+						xwm_log.errorf("Failed to prepare 1-layer flip entirely: %s", strerror( -ret ));
+						// We should always handle a 1-layer flip, this used to abort,
+						// but lets be more friendly and just avoid a commit and try again later.
+						// Let's re-poll our state, and force grab the best connector again.
+						//
+						// Some intense connector hotplugging could be occuring and the
+						// connector could become destroyed before we had a chance to use it
+						// as we hadn't reffed it in a commit yet.
+						this->DirtyState( true, false );
+						this->PollState();
+						return ret;
+					}
 				}
 			}
 

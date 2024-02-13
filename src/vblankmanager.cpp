@@ -189,14 +189,9 @@ namespace gamescope
 		return std::exchange( m_PendingVBlank, std::nullopt );
 	}
 
-	void CVBlankTimer::MarkVBlank( uint64_t ulNanos, bool bReArmTimer )
+	void CVBlankTimer::MarkVBlank( uint64_t ulNanos )
 	{
 		m_ulLastVBlank = ulNanos;
-		if ( bReArmTimer )
-		{
-			// Force timer re-arm with the new vblank timings.
-			ArmNextVBlank( false );
-		}
 	}
 
 	bool CVBlankTimer::WasCompositing() const
@@ -388,7 +383,147 @@ namespace gamescope
 			}
 		}
 	}
+
+	void FlipManager::NotifyLatch()
+	{
+		assert( !m_hasLatch );
+		m_hasLatch = true;
+	}
+
+	void FlipManager::NotifyNewBuffer(bool surfaceWantsAsync)
+	{
+		m_hasBuffer = true;
+		m_bufferIsAsync = surfaceWantsAsync;
+	}
+
+	bool FlipManager::Update()
+	{
+		bool sendCompletion = false;
+		switch (m_state)
+		{
+		case FlipManagerState::WaitFlip:
+			assert( !HasLatch() );
+			if (HasDoneFlip())
+			{
+				g_hasDoneFlip = false;
+				if (NextRepaintIsAsync())
+				{
+					sendCompletion = true;
+					TryFlip();
+				}
+				else
+				{
+					TransitionWaitLatch();
+				}
+			}
+			break;
+		case FlipManagerState::WaitLatch:
+			assert( !HasDoneFlip() );
+			if (HasLatch())
+			{
+				m_hasLatch = false;
+				sendCompletion = true;
+				TryFlip();
+			}
+			else if (NextRepaintIsAsync())
+			{
+				// TODO: Try to cancel the timer so that we can perform an async flip ASAP
+			}
+			break;
+		case FlipManagerState::Commitable:
+			if (!IsVRR() && !NextRepaintIsAsync())
+			{
+				// We need to switch to sync no-VRR mode where the Commitable state does not exist.
+				// Transition back to wait-latch.
+				TransitionWaitLatch();
+			}
+			else
+			{
+				TryFlip();
+			}
+			break;
+		}
+
+		return sendCompletion;
+	}
+
+    bool FlipManager::TryFlip()
+    {
+	    bool success = HasRepaint() && paint_all( NextRepaintIsAsync() );
+	    if (success)
+	    {
+		    m_state = FlipManagerState::WaitFlip;
+	    	m_hasBuffer = false;
+	    	hasRepaint = false;
+	    	hasRepaintNonBasePlane = false;
+	    }
+	    else
+	    {
+		    if (!NextRepaintIsAsync() && !IsVRR())
+		    {
+			    TransitionWaitLatch();
+		    }
+		    else
+		    {
+			    m_state = FlipManagerState::Commitable;
+		    }
+	    }
+	    return success;
+    }
+
+    bool FlipManager::HasRepaint() const
+    {
+		return hasRepaint || hasRepaintNonBasePlane;
+    }
+
+    bool FlipManager::NextRepaintIsAsync() const
+    {
+		// HACK: Disable tearing if we have an overlay to avoid stutters right now
+		// TODO: Fix properly.
+		const bool hasOverlay = (global_focus.overlayWindow && global_focus.overlayWindow->opacity) ||
+								(global_focus.externalOverlayWindow && global_focus.externalOverlayWindow->opacity) ||
+								(global_focus.overrideWindow && global_focus.focusWindow && !global_focus.focusWindow->isSteamStreamingClient && global_focus.overrideWindow->opacity);
+		const bool steamOverlayOpen = global_focus.overlayWindow && global_focus.overlayWindow->opacity;
+		// When doing forced repaints (animations, etc.), switch to sync present to
+		// throttle repaints to refresh rate.
+		// If we are compositing, always force sync flips because we currently wait
+		// for composition to finish before submitting.
+		// If we want to do async + composite, we should set up syncfile stuff and have DRM wait on it.
+		const bool needsSyncFlip = HasForcedRepaint() || GetVBlankTimer().WasCompositing() || steamOverlayOpen ||
+			hasOverlay;
+		return !needsSyncFlip && ((g_nAsyncFlipsEnabled >= 1) && GetBackend()->SupportsTearing() && m_bufferIsAsync);
+    }
+
+    bool FlipManager::HasLatch() const
+    {
+	    return m_hasLatch;
+    }
+
+    bool FlipManager::HasDoneFlip() const
+    {
+	    return g_hasDoneFlip;
+    }
+
+    bool FlipManager::IsVRR() const
+    {
+	    return GetBackend()->IsVRRActive();
+    }
+
+    bool FlipManager::HasForcedRepaint() const
+    {
+	    return g_bForceRepaint || is_fading_out();
+    }
+
+    void FlipManager::TransitionWaitLatch()
+    {
+	    assert( !HasLatch() );
+	    GetVBlankTimer().ArmNextVBlank( false );
+	    m_state = FlipManagerState::WaitLatch;
+    }
 }
+
+// TODO: Move this to somewhere more decent
+std::atomic<bool> g_hasDoneFlip;
 
 gamescope::CVBlankTimer &GetVBlankTimer()
 {

@@ -132,6 +132,17 @@ private:
 
 extern std::vector< wlr_surface * > wayland_surfaces_deleted;
 
+struct global_focus_t : public focus_t
+{
+	steamcompmgr_win_t	  	 		*keyboardFocusWindow;
+	steamcompmgr_win_t	  	 		*fadeWindow;
+	MouseCursor		*cursor;
+};
+extern global_focus_t global_focus;
+
+extern bool			hasRepaint;
+extern bool			hasRepaintNonBasePlane;
+
 extern bool hasFocusWindow;
 
 // These are used for touch scaling, so it's really the window that's focused for touch
@@ -142,11 +153,15 @@ extern float focusedWindowOffsetY;
 
 extern bool g_bFSRActive;
 
+extern std::atomic<bool> g_bForceRepaint;
+
 extern uint32_t inputCounter;
 extern uint64_t g_lastWinSeq;
 
 void nudge_steamcompmgr( void );
 void force_repaint( void );
+bool is_fading_out();
+bool paint_all( bool async );
 
 extern void mangoapp_update( uint64_t visible_frametime, uint64_t app_frametime_ns, uint64_t latency_ns );
 gamescope_xwayland_server_t *steamcompmgr_get_focused_server();
