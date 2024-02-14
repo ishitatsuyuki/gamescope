@@ -643,6 +643,7 @@ static void page_flip_handler(int fd, unsigned int frame, unsigned int sec, unsi
 	uint64_t vblanktime = sec * 1'000'000'000lu + usec * 1'000lu;
 	GetVBlankTimer().MarkVBlank( vblanktime );
 	g_hasDoneFlip = true;
+	nudge_steamcompmgr();
 
 	// TODO: get the fbids_queued instance from data if we ever have more than one in flight
 
