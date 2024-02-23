@@ -6185,7 +6185,8 @@ register_systray(xwayland_ctx_t *ctx)
 	XSetSelectionOwner(ctx->dpy, net_system_tray, ctx->ourWindow, 0);
 }
 
-bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t commitID, uint64_t earliestPresentTime, uint64_t earliestLatchTime )
+static bool
+handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t commitID, uint64_t earliestPresentTime, uint64_t earliestLatchTime, bool fifo )
 {
 	bool bFoundWindow = false;
 	uint32_t j;
@@ -6251,6 +6252,12 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 				hasRepaint = true;
 			}
 
+			if (fifo)
+			{
+				assert (!w->waitingForFifoFlip);
+				w->waitingForFifoFlip = true;
+			}
+
 			break;
 		}
 	}
@@ -6273,9 +6280,9 @@ bool handle_done_commit( steamcompmgr_win_t *w, xwayland_ctx_t *ctx, uint64_t co
 }
 
 // TODO: Merge these two functions.
-void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vblank_idx )
+void handle_done_commits_xwayland( xwayland_ctx_t *ctx )
 {
-	std::lock_guard<std::mutex> lock( ctx->doneCommits.listCommitsDoneLock );
+	std::lock_guard< std::mutex > lock( ctx->doneCommits.listCommitsDoneLock );
 
 	uint64_t next_refresh_time = g_SteamCompMgrVBlankTime.schedule.ulTargetVBlank;
 
@@ -6284,25 +6291,12 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 	commits_before_their_time.clear();
 	commits_before_their_time.reserve( 32 );
 
-	// windows in FIFO mode we got a new frame to present for this vblank
-	static std::unordered_set< uint64_t > fifo_win_seqs;
-	fifo_win_seqs.clear();
-	fifo_win_seqs.reserve( 32 );
-
 	uint64_t now = get_time_in_nanos();
 
-	vblank = vblank && steamcompmgr_should_vblank_window( true, vblank_idx );
-
 	// very fast loop yes
-	for ( auto& entry : ctx->doneCommits.listCommitsDone )
+	for ( auto &entry : ctx->doneCommits.listCommitsDone )
 	{
-		if (entry.fifo && (!vblank || fifo_win_seqs.count(entry.winSeq) > 0))
-		{
-			commits_before_their_time.push_back( entry );
-			continue;
-		}
-
-		if (!entry.earliestPresentTime)
+		if ( !entry.earliestPresentTime )
 		{
 			entry.earliestPresentTime = next_refresh_time;
 			entry.earliestLatchTime = now;
@@ -6316,14 +6310,15 @@ void handle_done_commits_xwayland( xwayland_ctx_t *ctx, bool vblank, uint64_t vb
 
 		for ( steamcompmgr_win_t *w = ctx->list; w; w = w->xwayland().next )
 		{
-			if (w->seq != entry.winSeq)
+			if ( w->seq != entry.winSeq )
 				continue;
-			if (handle_done_commit(w, ctx, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime))
+			if ( w->waitingForFifoFlip )
 			{
-				if (entry.fifo)
-					fifo_win_seqs.insert(entry.winSeq);
-				break;
+				commits_before_their_time.push_back( entry );
+				continue;
 			}
+			if ( handle_done_commit( w, ctx, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime, entry.fifo ) )
+				break;
 		}
 	}
 
@@ -6358,7 +6353,7 @@ void handle_done_commits_xdg()
 
 		for (const auto& xdg_win : g_steamcompmgr_xdg_wins)
 		{
-			if (handle_done_commit(xdg_win.get(), nullptr, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime))
+			if (handle_done_commit(xdg_win.get(), nullptr, entry.commitID, entry.earliestPresentTime, entry.earliestLatchTime, false))
 				break;
 		}
 	}
@@ -7541,7 +7536,6 @@ steamcompmgr_main(int argc, char **argv)
 		readyPipeFD = -1;
 	}
 
-	bool vblank = false;
 	g_SteamCompMgrWaiter.AddWaitable( &GetVBlankTimer() );
 
 	{
@@ -7756,7 +7750,15 @@ steamcompmgr_main(int argc, char **argv)
 			}
 		}
 
-		steamcompmgr_check_xdg(vblank);
+		steamcompmgr_check_xdg( false );
+
+		{
+			gamescope_xwayland_server_t *server = NULL;
+			for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+			{
+				handle_done_commits_xwayland( server->ctx.get() );
+			}
+		}
 
 		// Handles if we got a commit for the window we want to focus
 		// to switch to it for painting (outdatedInteractiveFocus)
@@ -7795,53 +7797,44 @@ steamcompmgr_main(int argc, char **argv)
 		// application can commit a new frame that completes before we ever displayed
 		// the current pending commit.
 		static uint64_t vblank_idx = 0;
-		if ( sendCompletion == true )
-		{
-			{
-				gamescope_xwayland_server_t *server = NULL;
-				for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-				{
-					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
-					{
-						steamcompmgr_latch_frame_done( w, vblank_idx );
-					}
-				}
-
-				for ( const auto& xdg_win : g_steamcompmgr_xdg_wins )
-				{
-					steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx );
-				}
-			}
-		}
-
-		{
-			gamescope_xwayland_server_t *server = NULL;
-			for (size_t i = 0; (server = wlserver_get_xwayland_server(i)); i++)
-			{
-				handle_done_commits_xwayland(server->ctx.get(), sendCompletion, vblank_idx);
-
-				// When we have observed both a complete commit and a VBlank, we should request a new frame.
-				if (sendCompletion)
-				{
-					for (steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next)
-					{
-						steamcompmgr_flush_frame_done(w);
-					}
-				}
-			}
-		}
-
 		if ( sendCompletion )
 		{
 			vblank_idx++;
 
 			int nRealRefresh = g_nNestedRefresh ? g_nNestedRefresh : g_nOutputRefresh;
 			int nTargetFPS = g_nSteamCompMgrTargetFPS ? g_nSteamCompMgrTargetFPS : nRealRefresh;
-			nTargetFPS = std::min<int>( nTargetFPS, nRealRefresh );
+			nTargetFPS = std::min< int >( nTargetFPS, nRealRefresh );
 			int nVblankDivisor = nRealRefresh / nTargetFPS;
 
 			g_SteamCompMgrAppRefreshCycle = 1'000'000'000ul / nRealRefresh;
 			g_SteamCompMgrLimitedAppRefreshCycle = 1'000'000'000ul / nRealRefresh * nVblankDivisor;
+
+			{
+				gamescope_xwayland_server_t *server = NULL;
+				for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+				{
+					for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
+					{
+						// TODO: Check VBlank multiplier
+						w->waitingForFifoFlip = false;
+						steamcompmgr_latch_frame_done( w, vblank_idx );
+					}
+				}
+
+				for ( const auto &xdg_win : g_steamcompmgr_xdg_wins )
+				{
+					xdg_win->waitingForFifoFlip = false;
+					steamcompmgr_latch_frame_done( xdg_win.get(), vblank_idx );
+				}
+
+				for ( size_t i = 0; ( server = wlserver_get_xwayland_server( i ) ); i++ )
+				{
+					for ( steamcompmgr_win_t *w = server->ctx->list; w; w = w->xwayland().next )
+					{
+						steamcompmgr_flush_frame_done( w );
+					}
+				}
+			}
 		}
 
 		// Handle presentation-time stuff

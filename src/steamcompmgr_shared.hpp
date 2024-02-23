@@ -130,6 +130,7 @@ struct steamcompmgr_win_t {
 
 	bool unlockedForFrameCallback;
 	bool receivedDoneCommit;
+	bool waitingForFifoFlip;
 
 	unsigned int mouseMoved;
 
