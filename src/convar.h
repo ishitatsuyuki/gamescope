@@ -85,6 +85,14 @@ namespace gamescope
 
     namespace detail { struct ConVarScriptRegistrar; }
 
+    template <typename T> class ConVar;
+
+    namespace detail
+    {
+        template <typename T>
+        void RegisterConVarScript( std::string_view name, ConVar<T> *cv );
+    }
+
     class ConCommand
     {
         friend struct detail::ConVarScriptRegistrar;
@@ -142,7 +150,7 @@ namespace gamescope
 
             if ( bRegisterScript )
             {
-                RegisterScript( pszName, this );
+                detail::RegisterConVarScript<T>( pszName, this );
             }
         }
 
