@@ -307,6 +307,7 @@ struct SteamWorkerShared {
     focus: Mutex<Option<FocusPublication>>,
     input_counter: Mutex<Option<u32>>,
     input_focus: Mutex<HashMap<u32, Option<u32>>>,
+    direct_scanout_status: Mutex<Option<u32>>,
     vrr_feedback: Mutex<Option<(bool, bool, bool)>>,
     refresh_millihz: Mutex<Option<i32>>,
     shutdown: AtomicBool,
@@ -424,6 +425,8 @@ impl SteamBridgeWorker {
             .expect("Steam input-counter mailbox poisoned") = Some(counter);
     }
 
+    /// Gamescope explicitly sets X input focus instead of relying on
+    /// WM_TAKE_FOCUS clients to do so. Keep the X request on the XWM worker.
     pub fn set_input_focus(&self, server_id: u32, window: Option<u32>) {
         self.shared
             .input_focus
@@ -438,6 +441,14 @@ impl SteamBridgeWorker {
             .vrr_feedback
             .lock()
             .expect("Steam VRR mailbox poisoned") = Some((capable, enabled, in_use));
+    }
+
+    pub fn publish_direct_scanout_status(&self, status: u32) {
+        *self
+            .shared
+            .direct_scanout_status
+            .lock()
+            .expect("direct-scanout status mailbox poisoned") = Some(status);
     }
 
     pub fn publish_refresh(&self, refresh_millihz: i32) {
@@ -526,6 +537,7 @@ struct SteamAtoms {
     refresh_feedback: Atom,
     fsr_feedback: Atom,
     input_counter: Atom,
+    direct_scanout_status: Atom,
     create_xwayland: Atom,
     create_xwayland_feedback: Atom,
     destroy_xwayland: Atom,
@@ -582,6 +594,7 @@ impl SteamAtoms {
             refresh_feedback: intern("GAMESCOPE_DISPLAY_REFRESH_RATE_FEEDBACK")?,
             fsr_feedback: intern("GAMESCOPE_FSR_FEEDBACK")?,
             input_counter: intern("GAMESCOPE_INPUT_COUNTER")?,
+            direct_scanout_status: intern("GAMESCOPE_DIRECT_SCANOUT_STATUS")?,
             create_xwayland: intern("GAMESCOPE_CREATE_XWAYLAND_SERVER")?,
             create_xwayland_feedback: intern("GAMESCOPE_CREATE_XWAYLAND_SERVER_FEEDBACK")?,
             destroy_xwayland: intern("GAMESCOPE_DESTROY_XWAYLAND_SERVER")?,
@@ -651,6 +664,7 @@ impl SteamX11Bridge {
         bridge.set_cardinal(bridge.atoms.hdr_enabled, &[0])?;
         bridge.set_cardinal(bridge.atoms.fsr_feedback, &[0])?;
         bridge.set_cardinal(bridge.atoms.input_counter, &[0])?;
+        bridge.set_cardinal(bridge.atoms.direct_scanout_status, &[1])?;
         let refresh_hz = u32::try_from((output_refresh_millihz + 500) / 1000).unwrap_or(0);
         bridge.set_cardinal(bridge.atoms.refresh_feedback, &[refresh_hz])?;
         bridge.connection.flush()?;
@@ -882,6 +896,12 @@ impl SteamX11Bridge {
         Ok(())
     }
 
+    pub fn publish_input_counter(&self, counter: u32) -> Result<(), Box<dyn Error>> {
+        self.set_cardinal(self.atoms.input_counter, &[counter])?;
+        self.connection.flush()?;
+        Ok(())
+    }
+
     pub fn set_input_focus(&self, window: Option<u32>) -> Result<(), Box<dyn Error>> {
         use x11rb::protocol::xproto::InputFocus;
         self.connection.set_input_focus(
@@ -893,8 +913,8 @@ impl SteamX11Bridge {
         Ok(())
     }
 
-    pub fn publish_input_counter(&self, counter: u32) -> Result<(), Box<dyn Error>> {
-        self.set_cardinal(self.atoms.input_counter, &[counter])?;
+    pub fn publish_direct_scanout_status(&self, status: u32) -> Result<(), Box<dyn Error>> {
+        self.set_cardinal(self.atoms.direct_scanout_status, &[status])?;
         self.connection.flush()?;
         Ok(())
     }
@@ -1153,6 +1173,15 @@ fn run_steam_worker(
                 .expect("Steam input-counter mailbox poisoned")
                 .take()
                 && let Err(error) = root.publish_input_counter(counter)
+            {
+                send_worker_error(&events, Some(0), error);
+            }
+            if let Some(status) = shared
+                .direct_scanout_status
+                .lock()
+                .expect("direct-scanout status mailbox poisoned")
+                .take()
+                && let Err(error) = root.publish_direct_scanout_status(status)
             {
                 send_worker_error(&events, Some(0), error);
             }

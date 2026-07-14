@@ -14,7 +14,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -28,7 +28,7 @@ use smithay::{
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         },
         drm::{
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime, VrrSupport,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmEventTime, DrmNode, NodeType, VrrSupport,
             compositor::{FrameError, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::GbmFramebufferExporter,
             output::{DrmOutput, DrmOutputManager, DrmOutputRenderElements},
@@ -37,7 +37,7 @@ use smithay::{
         renderer::{
             Color32F, ImportDma,
             element::{
-                Kind,
+                Kind, RenderElementPresentationState, RenderingReason,
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
                 utils::RescaleRenderElement,
             },
@@ -47,7 +47,11 @@ use smithay::{
     },
     output::{Mode as OutputMode, Output, PhysicalProperties},
     reexports::{
-        calloop::EventLoop,
+        calloop::{
+            EventLoop,
+            channel::{self, Channel, Sender as EventSender},
+            ping::{Ping, PingSource, make_ping},
+        },
         drm::control::{Mode as DrmMode, connector, crtc},
     },
     utils::{DeviceFd, Physical, Size, Transform},
@@ -55,7 +59,7 @@ use smithay::{
 use smithay_drm_extras::drm_scanner::DrmScanner;
 use tracing::{error, info, warn};
 
-use crate::{CursorLayer, OutputConfig, RenderLayer, State};
+use crate::{CursorLayer, LayerRenderElement, OutputConfig, RenderLayer, State};
 
 const COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Abgr2101010,
@@ -115,7 +119,7 @@ pub enum HardwareEvent {
         at: Instant,
         monotonic_time: Option<Duration>,
         sequence: u32,
-        direct_scanout: bool,
+        scanout_status: DirectScanoutStatus,
     },
     FrameDeferred {
         frame_id: u64,
@@ -126,6 +130,29 @@ pub enum HardwareEvent {
         asleep: bool,
     },
     Error(String),
+}
+
+/// Last primary-plane decision, also published for live diagnostics on X11.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DirectScanoutStatus {
+    Active,
+    Unavailable,
+    FormatUnsupported,
+    AtomicTestFailed,
+    CompositionRequired,
+}
+
+impl DirectScanoutStatus {
+    #[must_use]
+    pub const fn code(self) -> u32 {
+        match self {
+            Self::Active => 0,
+            Self::Unavailable => 1,
+            Self::FormatUnsupported => 2,
+            Self::AtomicTestFailed => 3,
+            Self::CompositionRequired => 4,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -220,30 +247,37 @@ fn unpack_refresh(screen: ScreenType, packed: u64) -> Option<RefreshCycleOverrid
 #[derive(Clone, Debug)]
 pub struct HardwareControl {
     shared: Arc<SharedCommands>,
+    wake: Ping,
 }
 
 impl HardwareControl {
     /// Replace the unpublished frame. Returns the id of an older frame that was
     /// coalesced, if one existed.
     pub fn submit(&self, frame: HardwareFrame) -> Option<u64> {
-        self.shared
+        let replaced = self
+            .shared
             .latest_frame
             .lock()
             .expect("DRM frame mailbox poisoned")
             .replace(frame)
-            .map(|old| old.id)
+            .map(|old| old.id);
+        self.wake.ping();
+        replaced
     }
 
     pub fn pause(&self) {
         self.shared.paused.store(true, Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn resume(&self) {
         self.shared.paused.store(false, Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn rescan(&self) {
         self.shared.rescan.store(true, Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn nudge_modeset(&self) {
@@ -255,16 +289,19 @@ impl HardwareControl {
         self.shared
             .vrr_request
             .store(if enabled { 2 } else { 1 }, Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn set_refresh_cycle(&self, request: RefreshCycleOverride) {
         refresh_mailbox(&self.shared, request.screen)
             .store(pack_refresh(request), Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn set_display_power(&self, operation: DisplayPowerOperation) {
         power_mailbox(&self.shared, operation.screen)
             .store(if operation.sleep { 2 } else { 1 }, Ordering::Release);
+        self.wake.ping();
     }
 
     pub fn set_force_internal(&self, force: bool) {
@@ -279,19 +316,21 @@ impl HardwareControl {
             REFRESH_REQUEST_VALID | u64::from(refresh_hz),
             Ordering::Release,
         );
+        self.wake.ping();
     }
 
     pub fn set_composite_force(&self, force: bool) {
         self.shared
             .composite_force
             .store(if force { 2 } else { 1 }, Ordering::Release);
+        self.wake.ping();
     }
 }
 
 /// Running DRM worker. Dropping it requests shutdown and joins the thread.
 pub struct HardwareBackend {
     control: HardwareControl,
-    events: Receiver<HardwareEvent>,
+    events: Option<Channel<HardwareEvent>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -300,21 +339,24 @@ impl HardwareBackend {
     /// modeset before returning.
     pub fn spawn(config: HardwareConfig) -> Result<(Self, HardwareOutputInfo), String> {
         let shared = Arc::new(SharedCommands::default());
+        let (wake, wake_source) =
+            make_ping().map_err(|error| format!("failed to create DRM worker wakeup: {error}"))?;
         let control = HardwareControl {
             shared: Arc::clone(&shared),
+            wake,
         };
-        let (events_tx, events) = mpsc::channel();
+        let (events_tx, events) = channel::channel();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("gamescope-drm".into())
-            .spawn(move || run_worker(config, shared, events_tx, ready_tx))
+            .spawn(move || run_worker(config, shared, events_tx, wake_source, ready_tx))
             .map_err(|error| format!("failed to start DRM thread: {error}"))?;
 
         match ready_rx.recv_timeout(Duration::from_secs(15)) {
             Ok(Ok(info)) => Ok((
                 Self {
                     control,
-                    events,
+                    events: Some(events),
                     thread: Some(thread),
                 },
                 info,
@@ -340,14 +382,16 @@ impl HardwareBackend {
         self.control.submit(frame)
     }
 
-    pub fn try_event(&self) -> Option<HardwareEvent> {
-        self.events.try_recv().ok()
+    /// Move the wakeable DRM event receiver into the Wayland event loop.
+    pub fn take_event_source(&mut self) -> Option<Channel<HardwareEvent>> {
+        self.events.take()
     }
 }
 
 impl Drop for HardwareBackend {
     fn drop(&mut self) {
         self.control.shared.shutdown.store(true, Ordering::Release);
+        self.control.wake.ping();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -357,7 +401,7 @@ impl Drop for HardwareBackend {
 #[derive(Clone, Copy, Debug)]
 struct FrameToken {
     id: u64,
-    direct_scanout: bool,
+    scanout_status: DirectScanoutStatus,
 }
 
 type OutputSurface = DrmOutput<
@@ -374,7 +418,8 @@ type OutputManager = DrmOutputManager<
     DrmDeviceFd,
 >;
 
-type ScaledSurfaceElement = RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>;
+type ScaledSurfaceElement =
+    LayerRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>;
 
 struct ActiveOutput {
     crtc: crtc::Handle,
@@ -408,15 +453,20 @@ struct DrmRuntime {
     // EGLDisplay has to outlive the renderer's context on all EGL drivers.
     _egl_display: EGLDisplay,
     active_output: Option<ActiveOutput>,
-    events: Sender<HardwareEvent>,
+    events: EventSender<HardwareEvent>,
 }
 
 impl DrmRuntime {
     fn new(
         config: HardwareConfig,
-        events: Sender<HardwareEvent>,
+        events: EventSender<HardwareEvent>,
     ) -> Result<(Self, smithay::backend::drm::DrmDeviceNotifier), Box<dyn Error>> {
         let drm_fd = DrmDeviceFd::new(DeviceFd::from(config.device_fd));
+        let primary_node = DrmNode::from_file(&drm_fd)?;
+        let render_node = primary_node
+            .node_with_type(NodeType::Render)
+            .transpose()?
+            .unwrap_or(primary_node);
         let (device, notifier) = DrmDevice::new(drm_fd.clone(), true)?;
         if !device.is_atomic() {
             return Err(format!(
@@ -438,8 +488,11 @@ impl DrmRuntime {
             gbm.clone(),
             GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
         );
-        let exporter = GbmFramebufferExporter::new(gbm.clone(), None);
-        let device_id = device.device_id();
+        // `None` explicitly disables client-buffer scanout in Smithay. Match
+        // dma-bufs against the GPU's render node, which is also the device Mesa
+        // sees through linux-dmabuf feedback.
+        let device_id = render_node.dev_id();
+        let exporter = GbmFramebufferExporter::new(gbm.clone(), Some(render_node));
         let manager = DrmOutputManager::new(
             device,
             allocator,
@@ -699,7 +752,10 @@ impl DrmRuntime {
                 )
                 .into_iter()
                 .map(|element| {
-                    RescaleRenderElement::from_element(element, cursor_origin.into(), scale)
+                    LayerRenderElement::new(
+                        RescaleRenderElement::from_element(element, cursor_origin.into(), scale),
+                        false,
+                    )
                 }),
             );
         }
@@ -715,15 +771,18 @@ impl DrmRuntime {
                     Kind::Unspecified,
                 )
                 .into_iter()
-                .map(|element| RescaleRenderElement::from_element(element, origin.into(), scale)),
+                .map(|element| {
+                    LayerRenderElement::new(
+                        RescaleRenderElement::from_element(element, origin.into(), scale),
+                        layer.force_blend,
+                    )
+                }),
             );
         }
 
-        let flags = if self.direct_scanout && !self.composite_force {
-            FrameFlags::DEFAULT
-        } else {
-            FrameFlags::empty()
-        };
+        let overlay_visible = frame.layers.iter().any(|layer| layer.force_blend);
+        let flags =
+            scanout_frame_flags(self.direct_scanout, self.composite_force || overlay_visible);
         let result = active.drm.render_frame(
             &mut self.renderer,
             &elements,
@@ -743,6 +802,26 @@ impl DrmRuntime {
 
         let is_empty = render.is_empty;
         let direct_scanout = matches!(render.primary_element, PrimaryPlaneElement::Element(_));
+        let scanout_status = if direct_scanout {
+            DirectScanoutStatus::Active
+        } else if flags.is_empty() {
+            DirectScanoutStatus::CompositionRequired
+        } else {
+            render
+                .states
+                .states
+                .values()
+                .find_map(|state| match state.presentation_state {
+                    RenderElementPresentationState::Rendering {
+                        reason: Some(RenderingReason::FormatUnsupported),
+                    } => Some(DirectScanoutStatus::FormatUnsupported),
+                    RenderElementPresentationState::Rendering {
+                        reason: Some(RenderingReason::ScanoutFailed),
+                    } => Some(DirectScanoutStatus::AtomicTestFailed),
+                    _ => None,
+                })
+                .unwrap_or(DirectScanoutStatus::Unavailable)
+        };
         if render.needs_sync()
             && let PrimaryPlaneElement::Swapchain(ref primary) = render.primary_element
             && let Err(error) = primary.sync.wait()
@@ -764,7 +843,7 @@ impl DrmRuntime {
 
         let token = FrameToken {
             id: frame.id,
-            direct_scanout,
+            scanout_status,
         };
         if let Err(error) = active.drm.queue_frame(token)
             && !matches!(error, FrameError::EmptyFrame)
@@ -798,7 +877,7 @@ impl DrmRuntime {
                         DrmEventTime::Realtime(_) => None,
                     }),
                     sequence: metadata.map_or(0, |metadata| metadata.sequence),
-                    direct_scanout: token.direct_scanout,
+                    scanout_status: token.scanout_status,
                 });
             }
             Ok(None) => {}
@@ -983,7 +1062,8 @@ impl DrmRuntime {
 fn run_worker(
     config: HardwareConfig,
     shared: Arc<SharedCommands>,
-    events: Sender<HardwareEvent>,
+    events: EventSender<HardwareEvent>,
+    wake_source: PingSource,
     ready: mpsc::SyncSender<Result<HardwareOutputInfo, String>>,
 ) {
     let mut event_loop = match EventLoop::<DrmRuntime>::try_new() {
@@ -1015,13 +1095,22 @@ fn run_worker(
         let _ = ready.send(Err(format!("failed to register DRM event source: {error}")));
         return;
     }
+    if let Err(error) = event_loop
+        .handle()
+        .insert_source(wake_source, |(), (), _runtime| {})
+    {
+        let _ = ready.send(Err(format!(
+            "failed to register DRM command wakeup: {error}"
+        )));
+        return;
+    }
     if ready.send(Ok(info)).is_err() {
         return;
     }
 
     let mut was_paused = false;
     while !shared.shutdown.load(Ordering::Acquire) {
-        if let Err(error) = event_loop.dispatch(Some(Duration::from_millis(2)), &mut runtime) {
+        if let Err(error) = event_loop.dispatch(Some(Duration::from_secs(1)), &mut runtime) {
             error!(%error, "DRM event loop failed");
             let _ = events.send(HardwareEvent::Error(format!(
                 "DRM event loop failed: {error}"
@@ -1196,6 +1285,18 @@ fn centered_origin(
     )
 }
 
+fn scanout_frame_flags(direct_scanout: bool, composite_force: bool) -> FrameFlags {
+    if direct_scanout && !composite_force {
+        // Gamescope scans out any client format accepted by the KMS primary
+        // plane. Smithay's DEFAULT deliberately restricts this to the
+        // compositor swapchain format, which needlessly forces common Vulkan
+        // formats through GLES composition.
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+    } else {
+        FrameFlags::empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::Ordering};
@@ -1204,7 +1305,7 @@ mod tests {
 
     use super::{
         HardwareControl, HardwareFrame, SharedCommands, connector_priority, pack_refresh,
-        parse_edid_identity, refresh_mailbox, unpack_refresh,
+        parse_edid_identity, refresh_mailbox, scanout_frame_flags, unpack_refresh,
     };
 
     fn frame(id: u64) -> HardwareFrame {
@@ -1215,12 +1316,18 @@ mod tests {
         }
     }
 
+    fn control(shared: &Arc<SharedCommands>) -> HardwareControl {
+        let (wake, _source) = smithay::reexports::calloop::ping::make_ping().expect("ping");
+        HardwareControl {
+            shared: Arc::clone(shared),
+            wake,
+        }
+    }
+
     #[test]
     fn frame_mailbox_is_bounded_and_latest_wins() {
         let shared = Arc::new(SharedCommands::default());
-        let control = HardwareControl {
-            shared: Arc::clone(&shared),
-        };
+        let control = control(&shared);
         assert_eq!(control.submit(frame(1)), None);
         assert_eq!(control.submit(frame(2)), Some(1));
         assert_eq!(
@@ -1237,9 +1344,7 @@ mod tests {
     #[test]
     fn refresh_requests_remain_isolated_per_screen() {
         let shared = Arc::new(SharedCommands::default());
-        let control = HardwareControl {
-            shared: Arc::clone(&shared),
-        };
+        let control = control(&shared);
         let request = RefreshCycleOverride {
             screen: ScreenType::Internal,
             frames_per_second: 40,
@@ -1263,6 +1368,16 @@ mod tests {
         assert_eq!(connector_priority(&priorities, "DP-2"), 0);
         assert_eq!(connector_priority(&priorities, "DP-1"), 1);
         assert_eq!(connector_priority(&priorities, "HDMI-A-1"), 2);
+    }
+
+    #[test]
+    fn direct_scanout_accepts_every_primary_plane_format() {
+        let flags = scanout_frame_flags(true, false);
+        assert!(flags.contains(
+            smithay::backend::drm::compositor::FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY
+        ));
+        assert!(scanout_frame_flags(true, true).is_empty());
+        assert!(scanout_frame_flags(false, false).is_empty());
     }
 
     #[test]

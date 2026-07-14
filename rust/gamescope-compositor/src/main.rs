@@ -1,10 +1,12 @@
 use std::{
-    collections::HashMap,
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
     error::Error,
     fs::OpenOptions,
     os::unix::process::CommandExt as _,
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -14,14 +16,18 @@ use std::{
 
 use ::winit::platform::pump_events::PumpStatus;
 use gamescope_compositor::{
-    ClientState, OutputConfig, State, SteamRuntimeRequest,
-    drm::{HardwareBackend, HardwareConfig, HardwareEvent, HardwareFrame, HardwareOutputInfo},
+    ClientState, LayerRenderElement, OutputConfig, State, SteamRuntimeRequest,
+    drm::{
+        DirectScanoutStatus, HardwareBackend, HardwareConfig, HardwareEvent, HardwareFrame,
+        HardwareOutputInfo,
+    },
     steam::{COMMON_COMPAT_ENV, STEAM_COMPAT_ENV},
 };
 use gamescope_core::control::{RefreshCycleOverride, ScreenType};
 use gamescope_wayland_server::{ActiveDisplayInfo, Command as GamescopeCommand, ServerConfig};
 use smithay::{
     backend::{
+        drm::DrmNode,
         egl::EGLDevice,
         input::{
             AbsolutePositionEvent, Axis, Event, GestureBeginEvent, GestureEndEvent,
@@ -46,11 +52,11 @@ use smithay::{
     input::keyboard::FilterResult,
     reexports::wayland_server::{Display, DisplayHandle, ListeningSocket},
     reexports::{
-        calloop::{EventLoop, LoopHandle, RegistrationToken},
+        calloop::{EventLoop, LoopHandle, RegistrationToken, channel::Event as ChannelEvent},
         input::Libinput,
         rustix::fs::OFlags,
     },
-    utils::{Rectangle, SERIAL_COUNTER, Serial, Transform},
+    utils::{Clock, Monotonic, Rectangle, SERIAL_COUNTER, Serial, Transform},
     wayland::{
         dmabuf::{DmabufFeedback, DmabufFeedbackBuilder},
         drm_syncobj::supports_syncobj_eventfd,
@@ -684,8 +690,9 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 .min(f64::from(size.h) / f64::from(output_size.h))
                 * state.global_scale_ratio();
             let render_origin = centered_origin(size, output_size, render_scale);
-            let mut elements =
-                Vec::<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>::new();
+            let mut elements = Vec::<
+                LayerRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
+            >::new();
             if let Some(cursor) = state.cursor_layer() {
                 on_commit_buffer_handler::<State>(&cursor.surface);
                 let cursor_origin = (
@@ -703,10 +710,13 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                     )
                     .into_iter()
                     .map(|element| {
-                        RescaleRenderElement::from_element(
-                            element,
-                            cursor_origin.into(),
-                            render_scale,
+                        LayerRenderElement::new(
+                            RescaleRenderElement::from_element(
+                                element,
+                                cursor_origin.into(),
+                                render_scale,
+                            ),
+                            false,
                         )
                     }),
                 );
@@ -724,10 +734,13 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                     )
                     .into_iter()
                     .map(|element| {
-                        RescaleRenderElement::from_element(
-                            element,
-                            render_origin.into(),
-                            render_scale,
+                        LayerRenderElement::new(
+                            RescaleRenderElement::from_element(
+                                element,
+                                render_origin.into(),
+                                render_scale,
+                            ),
+                            layer.force_blend,
                         )
                     }),
                 );
@@ -763,7 +776,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
 
     let mut display: Display<State> = Display::new()?;
     let mut handle = display.handle();
-    let (hardware, mut physical_output) = HardwareBackend::spawn(HardwareConfig {
+    let (mut hardware, mut physical_output) = HardwareBackend::spawn(HardwareConfig {
         device_path: drm_path.clone(),
         device_fd: worker_fd,
         logical_output: options.output.clone(),
@@ -786,11 +799,28 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     };
     let mut state =
         State::new_with_server_config(&handle, &output_config, options.steam, server_config);
+    state.set_dmabuf_node(DrmNode::from_dev_id(physical_output.device_id)?);
     state.enable_vt_switching();
     let limiter_file = LimiterFile::create()?;
     state.set_limiter_file(limiter_file.path().to_owned());
     let mut event_loop = EventLoop::<State>::try_new()?;
     state.set_loop_handle(event_loop.handle());
+    let hardware_events = Rc::new(RefCell::new(VecDeque::<HardwareEvent>::new()));
+    let hardware_event_queue = Rc::clone(&hardware_events);
+    let hardware_event_source = hardware
+        .take_event_source()
+        .ok_or("DRM event source was already registered")?;
+    event_loop.handle().insert_source(
+        hardware_event_source,
+        move |event, (), _state| match event {
+            ChannelEvent::Msg(event) => hardware_event_queue.borrow_mut().push_back(event),
+            ChannelEvent::Closed => {
+                hardware_event_queue
+                    .borrow_mut()
+                    .push_back(HardwareEvent::Error("DRM worker stopped".into()));
+            }
+        },
+    )?;
     let listener = if let Some(name) = options.socket.as_deref() {
         ListeningSocket::bind(name)?
     } else {
@@ -867,7 +897,6 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             _ => {}
         })?;
 
-    let start = state.started_at;
     let mut serial = 1_u32;
     let mut clients = Vec::new();
     let mut pending_command = (!options.command.is_empty()).then(|| options.command.clone());
@@ -883,9 +912,12 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     let mut frame_in_flight = None::<u64>;
     let mut repaint_at = Instant::now();
     let mut idle_present_at = None::<Instant>;
-    let mut last_direct_scanout = None::<bool>;
+    let mut last_scanout_status = None::<DirectScanoutStatus>;
     let mut output_asleep = false;
     let mut protocol_frame_intervals = [None::<Duration>; 2];
+    let monotonic_clock = Clock::<Monotonic>::new();
+    let mut last_flip_time = None::<Duration>;
+    let mut presentation_sequence = 0_u64;
 
     info!(
         socket = socket_name,
@@ -901,7 +933,19 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             info!("shutdown signal received");
             return Ok(());
         }
-        event_loop.dispatch(Some(Duration::from_millis(1)), &mut state)?;
+        let now = Instant::now();
+        let deadline = if idle_present_at.is_some() {
+            idle_present_at
+        } else if !output_asleep && frame_in_flight.is_none() {
+            Some(repaint_at)
+        } else {
+            None
+        };
+        let timeout = deadline
+            .map(|deadline| deadline.saturating_duration_since(now))
+            .unwrap_or(Duration::from_millis(2))
+            .min(Duration::from_millis(2));
+        event_loop.dispatch(Some(timeout), &mut state)?;
         if let Some(vt) = state.take_vt_switch() {
             info!(vt, "switching virtual terminal");
             if let Err(error) = session.change_vt(vt) {
@@ -1000,38 +1044,32 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         }
         state.update_timers();
 
-        while let Some(event) = hardware.try_event() {
+        while let Some(event) = hardware_events.borrow_mut().pop_front() {
             match event {
                 HardwareEvent::Presented {
                     frame_id,
                     at,
                     monotonic_time,
                     sequence,
-                    direct_scanout,
+                    scanout_status,
                 } => {
                     if frame_in_flight == Some(frame_id) {
                         frame_in_flight = None;
                     }
-                    if last_direct_scanout != Some(direct_scanout) {
-                        info!(direct_scanout, "DRM primary-plane path changed");
-                        last_direct_scanout = Some(direct_scanout);
+                    if last_scanout_status != Some(scanout_status) {
+                        info!(?scanout_status, "DRM primary-plane path changed");
+                        state.publish_direct_scanout_status(scanout_status.code());
+                        last_scanout_status = Some(scanout_status);
                     }
                     debug!(
                         frame_id,
-                        sequence, direct_scanout, "DRM page flip completed"
+                        sequence,
+                        ?scanout_status,
+                        "DRM page flip completed"
                     );
                     let refresh = physical_refresh_interval(&physical_output);
-                    let mut presentation_kind =
-                        wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
-                            | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwCompletion;
-                    if monotonic_time.is_some() {
-                        presentation_kind |= wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock;
-                    }
-                    state.presented_with_metadata(
-                        monotonic_time.unwrap_or_else(|| at.saturating_duration_since(start)),
-                        refresh,
-                        u64::from(sequence),
-                        presentation_kind,
+                    last_flip_time = Some(
+                        monotonic_time.unwrap_or_else(|| Duration::from(monotonic_clock.now())),
                     );
                     repaint_at = at
                         + repaint_delay(
@@ -1092,7 +1130,15 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         let now = Instant::now();
         if idle_present_at.is_some_and(|deadline| now >= deadline) {
             idle_present_at = None;
-            state.presented(now.saturating_duration_since(start));
+            let refresh = physical_refresh_interval(&physical_output);
+            presentation_sequence = presentation_sequence.wrapping_add(1);
+            state.presented_with_metadata(
+                Duration::from(monotonic_clock.now()),
+                refresh,
+                presentation_sequence,
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
+                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock,
+            );
             repaint_at = now + Duration::from_millis(1);
         }
         if !output_asleep
@@ -1109,6 +1155,29 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             }) {
                 debug!(replaced, frame_id, "coalesced obsolete DRM frame");
             }
+            // Gamescope intentionally releases PresentWait at the latest
+            // useful latch point and reports the predicted next display time.
+            // Waiting for the page-flip completion here costs an entire frame
+            // of application backpressure, especially at high refresh rates.
+            let refresh = physical_refresh_interval(&physical_output);
+            let interval = presentation_interval(
+                refresh,
+                protocol_frame_intervals[screen_slot(physical_output.screen)],
+            );
+            let predicted_present_time = last_flip_time
+                .map(|last_flip| last_flip.saturating_add(interval))
+                .unwrap_or_else(|| Duration::from(monotonic_clock.now()).saturating_add(refresh));
+            let presentation_kind =
+                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
+                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock
+                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::ZeroCopy;
+            presentation_sequence = presentation_sequence.wrapping_add(1);
+            state.presented_with_metadata(
+                predicted_present_time,
+                interval,
+                presentation_sequence,
+                presentation_kind,
+            );
             frame_in_flight = Some(frame_id);
         }
         display.flush_clients()?;
@@ -1311,8 +1380,12 @@ fn refresh_limit_interval(request: RefreshCycleOverride) -> Option<Duration> {
 }
 
 fn repaint_delay(refresh: Duration, frame_limit: Option<Duration>) -> Duration {
-    let target = frame_limit.map_or(refresh, |limit| limit.max(refresh));
+    let target = presentation_interval(refresh, frame_limit);
     target.saturating_sub(refresh.mul_f64(0.4))
+}
+
+fn presentation_interval(refresh: Duration, frame_limit: Option<Duration>) -> Duration {
+    frame_limit.map_or(refresh, |limit| limit.max(refresh))
 }
 
 fn active_display_info(output: &HardwareOutputInfo) -> ActiveDisplayInfo {

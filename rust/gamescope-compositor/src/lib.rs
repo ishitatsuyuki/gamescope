@@ -7,6 +7,7 @@ pub mod screenshot;
 pub mod steam;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Write as _,
     os::fd::OwnedFd,
@@ -27,8 +28,13 @@ use gamescope_wayland_server::{
 use smithay::{
     backend::{
         allocator::{Format, dmabuf::Dmabuf},
+        drm::DrmNode,
         input::{Axis, AxisSource, ButtonState, KeyState},
-        renderer::utils::on_commit_buffer_handler,
+        renderer::{
+            Renderer,
+            element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
+            utils::{CommitCounter, DamageSet, OpaqueRegions, on_commit_buffer_handler},
+        },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_drm_syncobj,
     delegate_fractional_scale, delegate_layer_shell, delegate_output, delegate_pointer_constraints,
@@ -37,7 +43,7 @@ use smithay::{
     delegate_xwayland_shell,
     input::{
         Seat, SeatHandler, SeatState,
-        keyboard::{FilterResult, KeysymHandle, XkbConfig},
+        keyboard::{FilterResult, KeyboardTarget, KeysymHandle, ModifiersState, XkbConfig},
         pointer::{
             AxisFrame, ButtonEvent, CursorImageAttributes, CursorImageStatus,
             GestureHoldBeginEvent, GestureHoldEndEvent, GesturePinchBeginEvent,
@@ -51,7 +57,9 @@ use smithay::{
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
     reexports::calloop::LoopHandle,
-    utils::{Logical, Point, SERIAL_COUNTER, Serial, Transform},
+    utils::{
+        Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Transform,
+    },
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -67,6 +75,7 @@ use smithay::{
         pointer_gestures::PointerGesturesState,
         presentation::{PresentationFeedbackCachedState, PresentationState, Refresh},
         relative_pointer::RelativePointerManagerState,
+        seat::WaylandFocus,
         selection::{
             SelectionHandler,
             data_device::{
@@ -84,7 +93,7 @@ use smithay::{
     },
     xwayland::{
         X11Surface, X11Wm, XWaylandClientData, XwmHandler,
-        xwm::{Reorder, ResizeEdge, XwmId},
+        xwm::{Reorder, ResizeEdge, WmWindowProperty, XwmId},
     },
 };
 use steam::{
@@ -172,6 +181,96 @@ pub struct ClientState {
 pub struct RenderLayer {
     pub surface: WlSurface,
     pub alpha: f32,
+    /// The layer contains per-pixel transparency and must not occlude lower
+    /// layers based solely on Xwayland's opaque-region hint.
+    pub force_blend: bool,
+}
+
+/// Preserve a render element's storage and geometry while optionally ignoring
+/// its opaque-region hint. Steam overlay buffers contain per-pixel alpha, and
+/// treating Xwayland's full-window hint as authoritative can cull the game
+/// below transparent pixels and replace it with the clear color.
+#[derive(Debug)]
+pub struct LayerRenderElement<E> {
+    element: E,
+    force_blend: bool,
+}
+
+impl<E> LayerRenderElement<E> {
+    #[must_use]
+    pub const fn new(element: E, force_blend: bool) -> Self {
+        Self {
+            element,
+            force_blend,
+        }
+    }
+}
+
+impl<E: Element> Element for LayerRenderElement<E> {
+    fn id(&self) -> &Id {
+        self.element.id()
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.element.current_commit()
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        self.element.src()
+    }
+
+    fn geometry(&self, scale: smithay::utils::Scale<f64>) -> Rectangle<i32, Physical> {
+        self.element.geometry(scale)
+    }
+
+    fn transform(&self) -> Transform {
+        self.element.transform()
+    }
+
+    fn damage_since(
+        &self,
+        scale: smithay::utils::Scale<f64>,
+        commit: Option<CommitCounter>,
+    ) -> DamageSet<i32, Physical> {
+        self.element.damage_since(scale, commit)
+    }
+
+    fn opaque_regions(&self, scale: smithay::utils::Scale<f64>) -> OpaqueRegions<i32, Physical> {
+        if self.force_blend {
+            OpaqueRegions::default()
+        } else {
+            self.element.opaque_regions(scale)
+        }
+    }
+
+    fn alpha(&self) -> f32 {
+        self.element.alpha()
+    }
+
+    fn kind(&self) -> Kind {
+        self.element.kind()
+    }
+}
+
+impl<R, E> RenderElement<R> for LayerRenderElement<E>
+where
+    R: Renderer,
+    E: RenderElement<R>,
+{
+    fn draw(
+        &self,
+        frame: &mut R::Frame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), R::Error> {
+        self.element.draw(frame, src, dst, damage, opaque_regions)
+    }
+
+    fn underlying_storage(&self, renderer: &mut R) -> Option<UnderlyingStorage<'_>> {
+        self.element.underlying_storage(renderer)
+    }
 }
 
 /// Client-supplied cursor surface positioned in logical output coordinates.
@@ -199,6 +298,106 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// Keyboard focus must retain the X11 wrapper so Smithay can apply the ICCCM
+/// input model before forwarding keys to Xwayland's Wayland surface.
+#[derive(Clone, Debug, PartialEq)]
+pub enum KeyboardFocusTarget {
+    Wayland(WlSurface),
+    X11(X11Surface),
+}
+
+impl KeyboardFocusTarget {
+    fn owned_wl_surface(&self) -> Option<WlSurface> {
+        match self {
+            Self::Wayland(surface) => Some(surface.clone()),
+            Self::X11(window) => window.wl_surface(),
+        }
+    }
+}
+
+impl WaylandFocus for KeyboardFocusTarget {
+    fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
+        match self {
+            Self::Wayland(surface) => Some(Cow::Borrowed(surface)),
+            Self::X11(window) => WaylandFocus::wl_surface(window),
+        }
+    }
+}
+
+impl IsAlive for KeyboardFocusTarget {
+    fn alive(&self) -> bool {
+        match self {
+            Self::Wayland(surface) => IsAlive::alive(surface),
+            Self::X11(window) => IsAlive::alive(window),
+        }
+    }
+}
+
+impl KeyboardTarget<State> for KeyboardFocusTarget {
+    fn enter(
+        &self,
+        seat: &Seat<State>,
+        state: &mut State,
+        keys: Vec<KeysymHandle<'_>>,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, state, keys, serial),
+            Self::X11(window) => KeyboardTarget::enter(window, seat, state, keys, serial),
+        }
+    }
+
+    fn leave(&self, seat: &Seat<State>, state: &mut State, serial: Serial) {
+        match self {
+            Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, state, serial),
+            Self::X11(window) => KeyboardTarget::leave(window, seat, state, serial),
+        }
+    }
+
+    fn key(
+        &self,
+        seat: &Seat<State>,
+        state: &mut State,
+        key: KeysymHandle<'_>,
+        key_state: KeyState,
+        serial: Serial,
+        time: u32,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::key(surface, seat, state, key, key_state, serial, time);
+            }
+            Self::X11(window) => {
+                KeyboardTarget::key(window, seat, state, key, key_state, serial, time);
+            }
+        }
+    }
+
+    fn modifiers(
+        &self,
+        seat: &Seat<State>,
+        state: &mut State,
+        modifiers: ModifiersState,
+        serial: Serial,
+    ) {
+        match self {
+            Self::Wayland(surface) => {
+                KeyboardTarget::modifiers(surface, seat, state, modifiers, serial);
+            }
+            Self::X11(window) => {
+                KeyboardTarget::modifiers(window, seat, state, modifiers, serial);
+            }
+        }
+    }
+}
+
+const fn x11_property_changes_input_mode(property: WmWindowProperty) -> bool {
+    matches!(
+        property,
+        WmWindowProperty::Hints | WmWindowProperty::Protocols
+    )
+}
+
 /// Complete protocol state for the compositor frontend.
 pub struct State {
     pub compositor_state: CompositorState,
@@ -219,12 +418,14 @@ pub struct State {
     pub output: Output,
     pub pointer_location: Point<f64, Logical>,
     pub focused_surface: Option<WlSurface>,
+    keyboard_focus: Option<KeyboardFocusTarget>,
     pub cursor_status: CursorImageStatus,
     pub started_at: Instant,
     pub xwms: HashMap<XwmId, X11Wm>,
     pub xdisplay: Option<u32>,
     pub xdisplays: HashMap<u32, u32>,
     dmabuf_global: Option<DmabufGlobal>,
+    dmabuf_node: Option<DrmNode>,
     frame_sequence: u64,
     pending_swapchain_commits: Vec<(WlSurface, CommitMetadata)>,
     pressed_keysyms: Vec<u32>,
@@ -364,12 +565,14 @@ impl State {
             output,
             pointer_location: (0.0, 0.0).into(),
             focused_surface: None,
+            keyboard_focus: None,
             cursor_status: CursorImageStatus::default_named(),
             started_at: Instant::now(),
             xwms: HashMap::new(),
             xdisplay: None,
             xdisplays: HashMap::new(),
             dmabuf_global: None,
+            dmabuf_node: None,
             frame_sequence: 0,
             pending_swapchain_commits: Vec::new(),
             pressed_keysyms: Vec::new(),
@@ -428,6 +631,15 @@ impl State {
         if let Some(global) = self.dmabuf_global.as_ref() {
             self.dmabuf_state.set_default_feedback(global, feedback);
         }
+    }
+
+    /// Tag imported dma-bufs with the render node advertised in feedback.
+    ///
+    /// The DRM framebuffer exporter uses this hint to reject buffers from a
+    /// different GPU. The linux-dmabuf protocol itself does not carry a node,
+    /// so the compositor must supply the device selected for rendering.
+    pub fn set_dmabuf_node(&mut self, node: DrmNode) {
+        self.dmabuf_node = Some(node);
     }
 
     /// Attach the Wayland event-loop handle used by asynchronous transaction
@@ -745,6 +957,11 @@ impl State {
         self.steam_worker.publish_vrr(capable, enabled, in_use);
     }
 
+    /// Publish the DRM primary-plane decision for runtime verification.
+    pub fn publish_direct_scanout_status(&self, status: u32) {
+        self.steam_worker.publish_direct_scanout_status(status);
+    }
+
     /// Publish physical connector information to all gamescope-control clients.
     pub fn publish_active_display(&mut self, display: ActiveDisplayInfo) {
         self.gamescope_state.set_active_display(Some(display));
@@ -977,6 +1194,7 @@ impl State {
                     vec![RenderLayer {
                         surface,
                         alpha: 1.0,
+                        force_blend: false,
                     }]
                 })
                 .unwrap_or_default();
@@ -987,6 +1205,7 @@ impl State {
             layers.push(RenderLayer {
                 surface,
                 alpha: 1.0,
+                force_blend: false,
             });
         }
         if let Some(override_window) = self.selected_override(&focus)
@@ -995,6 +1214,7 @@ impl State {
             layers.push(RenderLayer {
                 surface,
                 alpha: 1.0,
+                force_blend: true,
             });
         }
 
@@ -1023,10 +1243,14 @@ impl State {
                     .unwrap_or(0)
             });
         for window in [notification, primary_overlay].into_iter().flatten() {
-            if let Some(surface) = self.render_surface_for_x11(window) {
+            let metadata = self.metadata_for(window);
+            if metadata.opacity != 0
+                && let Some(surface) = self.render_surface_for_x11(window)
+            {
                 layers.push(RenderLayer {
                     surface,
-                    alpha: self.metadata_for(window).alpha(),
+                    alpha: metadata.alpha(),
+                    force_blend: true,
                 });
             }
         }
@@ -1037,11 +1261,13 @@ impl State {
             .filter(|window| window.is_mapped() && self.metadata_for(window).external_overlay)
             .max_by_key(|window| self.metadata_for(window).opacity);
         if let Some(window) = external
+            && self.metadata_for(window).opacity != 0
             && let Some(surface) = self.render_surface_for_x11(window)
         {
             layers.push(RenderLayer {
                 surface,
                 alpha: self.metadata_for(window).alpha(),
+                force_blend: true,
             });
         }
         layers
@@ -1122,8 +1348,11 @@ impl State {
         self.apply_x11_focus();
         let next = self
             .keyboard_x11_window()
-            .and_then(|window| Self::input_surface_for_x11(&window))
-            .or_else(|| self.primary_input_surface());
+            .map(KeyboardFocusTarget::X11)
+            .or_else(|| {
+                self.primary_input_surface()
+                    .map(KeyboardFocusTarget::Wayland)
+            });
         self.set_keyboard_focus(next, serial);
         self.publish_steam_focus();
     }
@@ -1155,6 +1384,18 @@ impl State {
             }
         }
 
+        // Upstream Gamescope always applies XSetInputFocus, including for the
+        // globally-active ICCCM model used by Wine/Unity. Reassert it on every
+        // focus refresh because late WM_HINTS or xwayland-shell association
+        // can temporarily clear Xwayland's core focus without changing our
+        // selected window.
+        for (xwm_id, server_id) in &self.xwayland_server_ids {
+            let target = next_key
+                .filter(|(target_xwm, _)| target_xwm == xwm_id)
+                .map(|(_, window)| window);
+            self.steam_worker.set_input_focus(*server_id, target);
+        }
+
         if next_key == self.last_x11_focus {
             return;
         }
@@ -1168,12 +1409,6 @@ impl State {
             }
         }
 
-        for (xwm_id, server_id) in &self.xwayland_server_ids {
-            let target = next_key
-                .filter(|(target_xwm, _)| target_xwm == xwm_id)
-                .map(|(_, window)| window);
-            self.steam_worker.set_input_focus(*server_id, target);
-        }
         if let Some(window) = keyboard_window
             && let Some(xwm_id) = window.xwm_id()
             && let Some(xwm) = self.xwms.get_mut(&xwm_id)
@@ -1231,12 +1466,19 @@ impl State {
         );
     }
 
-    fn set_keyboard_focus(&mut self, next: Option<WlSurface>, serial: Serial) {
-        if next != self.focused_surface {
-            self.focused_surface.clone_from(&next);
+    fn set_keyboard_focus(&mut self, next: Option<KeyboardFocusTarget>, serial: Serial) {
+        if next != self.keyboard_focus {
             if let Some(keyboard) = self.seat.get_keyboard() {
                 keyboard.set_focus(self, next, serial);
             }
+        }
+    }
+
+    fn clear_early_x11_focus(&mut self, window: &X11Surface) {
+        if self.keyboard_focus.as_ref().is_some_and(
+            |focus| matches!(focus, KeyboardFocusTarget::X11(focused) if focused == window),
+        ) {
+            self.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
         }
     }
 
@@ -1885,11 +2127,15 @@ impl DmabufHandler for State {
     fn dmabuf_imported(
         &mut self,
         _global: &DmabufGlobal,
-        _dmabuf: Dmabuf,
+        dmabuf: Dmabuf,
         notifier: ImportNotifier,
     ) {
-        // The nested renderer imports lazily when the surface tree is drawn.
-        // DRM backends replace this with an early device-specific import.
+        if let Some(node) = self.dmabuf_node {
+            dmabuf.set_node(node);
+        }
+        // Renderers import lazily when the surface tree is drawn. On DRM the
+        // node tag above also permits the KMS framebuffer exporter to attempt
+        // direct scanout without forcing an otherwise redundant GL import.
         let _ = notifier.successful::<Self>();
     }
 }
@@ -1962,7 +2208,10 @@ impl CompositorHandler for State {
                 .push((surface.clone(), metadata));
         }
         if self.focused_surface.is_none() {
-            self.set_keyboard_focus(Some(surface.clone()), SERIAL_COUNTER.next_serial());
+            self.set_keyboard_focus(
+                Some(KeyboardFocusTarget::Wayland(surface.clone())),
+                SERIAL_COUNTER.next_serial(),
+            );
         }
     }
 }
@@ -1983,7 +2232,7 @@ impl XdgShellHandler for State {
         });
         let _ = surface.send_configure();
         self.set_keyboard_focus(
-            Some(surface.wl_surface().clone()),
+            Some(KeyboardFocusTarget::Wayland(surface.wl_surface().clone())),
             SERIAL_COUNTER.next_serial(),
         );
     }
@@ -2027,7 +2276,7 @@ impl WlrLayerShellHandler for State {
         }
         surface.send_configure();
         self.set_keyboard_focus(
-            Some(surface.wl_surface().clone()),
+            Some(KeyboardFocusTarget::Wayland(surface.wl_surface().clone())),
             SERIAL_COUNTER.next_serial(),
         );
     }
@@ -2043,6 +2292,10 @@ impl XWaylandShellHandler for State {
             self.x11_windows.push(window.clone());
         }
         self.track_x11_window(&window);
+        // X11 mapping and focus may precede xwayland-shell association. The
+        // first enter then has no wl_surface to notify, so re-enter now that
+        // Xwayland has attached its input surface.
+        self.clear_early_x11_focus(&window);
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 }
@@ -2161,13 +2414,14 @@ impl XwmHandler for State {
     ) {
     }
 
-    fn property_notify(
-        &mut self,
-        xwm: XwmId,
-        window: X11Surface,
-        _property: smithay::xwayland::xwm::WmWindowProperty,
-    ) {
+    fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
         self.refresh_x11_metadata(xwm, window.window_id());
+        // Wine commonly installs WM_HINTS and WM_TAKE_FOCUS after mapping.
+        // Re-enter the already selected target so Smithay re-evaluates the
+        // ICCCM input model and sends WM_TAKE_FOCUS without requiring a click.
+        if x11_property_changes_input_mode(property) {
+            self.clear_early_x11_focus(&window);
+        }
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 
@@ -2237,7 +2491,7 @@ impl ServerDndGrabHandler for State {
 }
 
 impl SeatHandler for State {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = KeyboardFocusTarget;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -2245,8 +2499,9 @@ impl SeatHandler for State {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&WlSurface>) {
-        self.focused_surface = focused.cloned();
+    fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
+        self.keyboard_focus = focused.cloned();
+        self.focused_surface = focused.and_then(KeyboardFocusTarget::owned_wl_surface);
     }
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
@@ -2283,8 +2538,67 @@ pub fn client_data() -> Arc<ClientState> {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{OutputConfig, State, vt_from_pressed_evdev_keys};
+    use smithay::{
+        backend::renderer::{
+            element::{Element, Id, Kind},
+            utils::{CommitCounter, DamageSet, OpaqueRegions},
+        },
+        utils::{Buffer, Physical, Rectangle, Scale, Transform},
+    };
+
+    use super::{
+        LayerRenderElement, OutputConfig, State, vt_from_pressed_evdev_keys,
+        x11_property_changes_input_mode,
+    };
+    use smithay::xwayland::xwm::WmWindowProperty;
     use wayland_server::Display;
+
+    #[derive(Debug)]
+    struct OpaqueElement {
+        id: Id,
+    }
+
+    impl Element for OpaqueElement {
+        fn id(&self) -> &Id {
+            &self.id
+        }
+
+        fn current_commit(&self) -> CommitCounter {
+            CommitCounter::default()
+        }
+
+        fn src(&self) -> Rectangle<f64, Buffer> {
+            Rectangle::from_size((64.0, 64.0).into())
+        }
+
+        fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+            Rectangle::from_size((64, 64).into())
+        }
+
+        fn transform(&self) -> Transform {
+            Transform::Normal
+        }
+
+        fn damage_since(
+            &self,
+            _scale: Scale<f64>,
+            _commit: Option<CommitCounter>,
+        ) -> DamageSet<i32, Physical> {
+            DamageSet::default()
+        }
+
+        fn opaque_regions(&self, _scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
+            OpaqueRegions::from_slice(&[Rectangle::from_size((64, 64).into())])
+        }
+
+        fn alpha(&self) -> f32 {
+            1.0
+        }
+
+        fn kind(&self) -> Kind {
+            Kind::Unspecified
+        }
+    }
 
     #[test]
     fn output_mode_preserves_gamescope_millihertz_units() {
@@ -2310,6 +2624,22 @@ mod tests {
         }
         .resolved_for_output(2560, 1440);
         assert_eq!((height_only.width, height_only.height), (1600, 900));
+    }
+
+    #[test]
+    fn blended_overlay_never_culls_the_game_below_it() {
+        let blended = LayerRenderElement::new(OpaqueElement { id: Id::new() }, true);
+        assert!(blended.opaque_regions(Scale::from(1.0)).is_empty());
+
+        let base = LayerRenderElement::new(OpaqueElement { id: Id::new() }, false);
+        assert_eq!(base.opaque_regions(Scale::from(1.0)).len(), 1);
+    }
+
+    #[test]
+    fn late_icccm_focus_metadata_forces_x11_reentry() {
+        assert!(x11_property_changes_input_mode(WmWindowProperty::Hints));
+        assert!(x11_property_changes_input_mode(WmWindowProperty::Protocols));
+        assert!(!x11_property_changes_input_mode(WmWindowProperty::Title));
     }
 
     #[test]
