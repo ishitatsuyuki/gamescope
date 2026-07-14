@@ -1,0 +1,19 @@
+[package]
+name = "gamescope-wayland-server"
+version = "0.1.0"
+description = "Wayland protocol dispatch for the Rust Gamescope port"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+gamescope-core = { path = "../gamescope-core" }
+gamescope-protocols = { path = "../gamescope-protocols", default-features = false, features = ["server"] }
+wayland-server = "0.31.13"
+
+[dev-dependencies]
+gamescope-protocols = { path = "../gamescope-protocols", features = ["client", "server"] }
+wayland-client = "0.31.14"
+
+[lints]
+workspace = true

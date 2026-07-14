@@ -1,0 +1,16 @@
+[workspace]
+members = [
+    "rust/gamescope-compositor",
+    "rust/gamescope-core",
+    "rust/gamescope-protocols",
+    "rust/gamescope-wayland-server",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+rust-version = "1.86"
+
+[workspace.lints.rust]
+unsafe_code = "deny"

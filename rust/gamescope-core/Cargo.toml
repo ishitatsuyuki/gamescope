@@ -1,0 +1,13 @@
+[package]
+name = "gamescope-core"
+version = "0.1.0"
+description = "Hardware-independent policy and protocol state for a Rust Gamescope port"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+xkeysym = "0.2.1"
+
+[lints]
+workspace = true

@@ -1,0 +1,50 @@
+[package]
+name = "gamescope-compositor"
+version = "0.1.0"
+description = "Native Rust Gamescope compositor executable"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "gamescope-rs"
+path = "src/main.rs"
+
+[dependencies]
+gamescope-core = { path = "../gamescope-core" }
+gamescope-wayland-server = { path = "../gamescope-wayland-server" }
+nix = { version = "0.31.1", default-features = false, features = ["signal"] }
+png = "0.18.0"
+signal-hook = "0.3.18"
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_winit",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "desktop",
+    "renderer_gl",
+    "wayland_frontend",
+    "xwayland",
+] }
+smithay-drm-extras = { version = "0.1.0", default-features = false }
+thiserror = "2.0.12"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+wayland-protocols = { version = "0.32.13", features = ["server", "staging", "unstable"] }
+wayland-server = "0.31.13"
+winit = { version = "0.30.0", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
+    "x11",
+] }
+x11rb = { version = "0.13.2", features = ["res"] }
+
+[dev-dependencies]
+gamescope-protocols = { path = "../gamescope-protocols", default-features = false, features = ["client"] }
+wayland-client = "0.31.14"
+
+[lints]
+workspace = true
