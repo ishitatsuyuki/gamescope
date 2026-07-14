@@ -902,7 +902,9 @@ impl DrmRuntime {
     }
 
     fn set_vrr(&mut self, enabled: bool) {
-        self.adaptive_sync = enabled;
+        if !replace_bool_if_changed(&mut self.adaptive_sync, enabled) {
+            return;
+        }
         let Some(active) = self.active_output.as_mut() else {
             return;
         };
@@ -911,12 +913,14 @@ impl DrmRuntime {
             .with_compositor(|compositor| compositor.use_vrr(enabled))
         {
             Ok(()) => {
-                active.info.vrr_enabled = active
+                let vrr_enabled = active
                     .drm
                     .with_compositor(|compositor| compositor.vrr_enabled());
-                let _ = self
-                    .events
-                    .send(HardwareEvent::OutputChanged(active.info.clone()));
+                if replace_bool_if_changed(&mut active.info.vrr_enabled, vrr_enabled) {
+                    let _ = self
+                        .events
+                        .send(HardwareEvent::OutputChanged(active.info.clone()));
+                }
             }
             Err(error) => {
                 let _ = self.events.send(HardwareEvent::Error(format!(
@@ -1297,6 +1301,15 @@ fn scanout_frame_flags(direct_scanout: bool, composite_force: bool) -> FrameFlag
     }
 }
 
+fn replace_bool_if_changed(current: &mut bool, next: bool) -> bool {
+    if *current == next {
+        false
+    } else {
+        *current = next;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::Ordering};
@@ -1305,7 +1318,8 @@ mod tests {
 
     use super::{
         HardwareControl, HardwareFrame, SharedCommands, connector_priority, pack_refresh,
-        parse_edid_identity, refresh_mailbox, scanout_frame_flags, unpack_refresh,
+        parse_edid_identity, refresh_mailbox, replace_bool_if_changed, scanout_frame_flags,
+        unpack_refresh,
     };
 
     fn frame(id: u64) -> HardwareFrame {
@@ -1378,6 +1392,19 @@ mod tests {
         ));
         assert!(scanout_frame_flags(true, true).is_empty());
         assert!(scanout_frame_flags(false, false).is_empty());
+    }
+
+    #[test]
+    fn unchanged_vrr_requests_and_feedback_do_not_report_transitions() {
+        let mut requested = false;
+        assert!(!replace_bool_if_changed(&mut requested, false));
+        assert!(replace_bool_if_changed(&mut requested, true));
+        assert!(!replace_bool_if_changed(&mut requested, true));
+
+        let mut hardware_feedback = false;
+        assert!(!replace_bool_if_changed(&mut hardware_feedback, false));
+        assert!(replace_bool_if_changed(&mut hardware_feedback, true));
+        assert!(!replace_bool_if_changed(&mut hardware_feedback, true));
     }
 
     #[test]

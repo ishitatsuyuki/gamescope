@@ -832,11 +832,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         .ok_or("Wayland socket has no UTF-8 name")?
         .to_owned();
 
-    state.publish_hardware_vrr(
-        physical_output.vrr_capable,
-        physical_output.vrr_enabled,
-        physical_output.vrr_enabled,
-    );
+    state.publish_hardware_vrr(physical_output.vrr_capable, physical_output.vrr_enabled);
 
     if supports_syncobj_eventfd(&physical_output.syncobj_device) {
         state.init_drm_syncobj(&handle, physical_output.syncobj_device.clone());
@@ -1095,7 +1091,6 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                     state.publish_output_mode(&logical_output);
                     state.publish_hardware_vrr(
                         physical_output.vrr_capable,
-                        physical_output.vrr_enabled,
                         physical_output.vrr_enabled,
                     );
                     match hardware_dmabuf_feedback(&physical_output) {

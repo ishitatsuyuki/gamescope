@@ -6,6 +6,7 @@
 //! properties and publishes the root-window feedback consumed by Steam.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet},
     error::Error,
     fs, process,
@@ -308,7 +309,7 @@ struct SteamWorkerShared {
     input_counter: Mutex<Option<u32>>,
     input_focus: Mutex<HashMap<u32, Option<u32>>>,
     direct_scanout_status: Mutex<Option<u32>>,
-    vrr_feedback: Mutex<Option<(bool, bool, bool)>>,
+    vrr_feedback: Mutex<Option<(bool, bool)>>,
     refresh_millihz: Mutex<Option<i32>>,
     shutdown: AtomicBool,
 }
@@ -435,12 +436,12 @@ impl SteamBridgeWorker {
             .insert(server_id, window);
     }
 
-    pub fn publish_vrr(&self, capable: bool, enabled: bool, in_use: bool) {
+    pub fn publish_vrr(&self, capable: bool, in_use: bool) {
         *self
             .shared
             .vrr_feedback
             .lock()
-            .expect("Steam VRR mailbox poisoned") = Some((capable, enabled, in_use));
+            .expect("Steam VRR mailbox poisoned") = Some((capable, in_use));
     }
 
     pub fn publish_direct_scanout_status(&self, status: u32) {
@@ -549,6 +550,21 @@ struct SteamAtoms {
     net_active_window: Atom,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct VrrFeedbackState {
+    capable: bool,
+    in_use: bool,
+}
+
+impl VrrFeedbackState {
+    const fn changes_from(self, previous: Self) -> (bool, bool) {
+        (
+            self.capable != previous.capable,
+            self.in_use != previous.in_use,
+        )
+    }
+}
+
 impl SteamAtoms {
     fn new(connection: &RustConnection) -> Result<Self, Box<dyn Error>> {
         let intern = |name: &str| -> Result<Atom, Box<dyn Error>> {
@@ -630,6 +646,7 @@ pub struct SteamX11Bridge {
     root: Window,
     display_name: String,
     pub server_id: u32,
+    vrr_feedback_state: Cell<VrrFeedbackState>,
 }
 
 impl SteamX11Bridge {
@@ -653,6 +670,8 @@ impl SteamX11Bridge {
             root,
             display_name,
             server_id,
+            // connect() force-initializes both feedback atoms to false below.
+            vrr_feedback_state: Cell::new(VrrFeedbackState::default()),
         };
         bridge.set_cardinal(bridge.atoms.xwayland_server_id, &[server_id])?;
         bridge.set_cardinal(bridge.atoms.gamescope_pid, &[process::id()])?;
@@ -919,16 +938,21 @@ impl SteamX11Bridge {
         Ok(())
     }
 
-    pub fn publish_vrr(
-        &self,
-        capable: bool,
-        enabled: bool,
-        in_use: bool,
-    ) -> Result<(), Box<dyn Error>> {
-        self.set_cardinal(self.atoms.vrr_capable, &[u32::from(capable)])?;
-        self.set_cardinal(self.atoms.vrr_enabled, &[u32::from(enabled)])?;
-        self.set_cardinal(self.atoms.vrr_feedback, &[u32::from(in_use)])?;
+    pub fn publish_vrr(&self, capable: bool, in_use: bool) -> Result<(), Box<dyn Error>> {
+        let previous = self.vrr_feedback_state.get();
+        let next = VrrFeedbackState { capable, in_use };
+        let (capable_changed, in_use_changed) = next.changes_from(previous);
+        if !capable_changed && !in_use_changed {
+            return Ok(());
+        }
+        if capable_changed {
+            self.set_cardinal(self.atoms.vrr_capable, &[u32::from(capable)])?;
+        }
+        if in_use_changed {
+            self.set_cardinal(self.atoms.vrr_feedback, &[u32::from(in_use)])?;
+        }
         self.connection.flush()?;
+        self.vrr_feedback_state.set(next);
         Ok(())
     }
 
@@ -1185,12 +1209,12 @@ fn run_steam_worker(
             {
                 send_worker_error(&events, Some(0), error);
             }
-            if let Some((capable, enabled, in_use)) = shared
+            if let Some((capable, in_use)) = shared
                 .vrr_feedback
                 .lock()
                 .expect("Steam VRR mailbox poisoned")
                 .take()
-                && let Err(error) = root.publish_vrr(capable, enabled, in_use)
+                && let Err(error) = root.publish_vrr(capable, in_use)
             {
                 send_worker_error(&events, Some(0), error);
             }
@@ -1333,9 +1357,28 @@ fn app_id_from_reaper_command_line(command_line: &[u8]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::{
-        FocusCandidate, FocusControl, STEAM_APP_ID, WindowMetadata,
+        FocusCandidate, FocusControl, STEAM_APP_ID, VrrFeedbackState, WindowMetadata,
         app_id_from_reaper_command_line, select_focus, select_managed_ancestor, select_override,
     };
+
+    #[test]
+    fn vrr_feedback_only_changes_capability_and_usage_atoms_when_needed() {
+        let disabled = VrrFeedbackState::default();
+        assert_eq!(disabled.changes_from(disabled), (false, false));
+
+        let capable = VrrFeedbackState {
+            capable: true,
+            in_use: false,
+        };
+        assert_eq!(capable.changes_from(disabled), (true, false));
+
+        let active = VrrFeedbackState {
+            capable: true,
+            in_use: true,
+        };
+        assert_eq!(active.changes_from(capable), (false, true));
+        assert_eq!(active.changes_from(active), (false, false));
+    }
 
     fn candidate(window_id: u32, app_id: u32, sequence: u64) -> FocusCandidate {
         FocusCandidate {

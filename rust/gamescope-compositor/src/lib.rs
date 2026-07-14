@@ -953,8 +953,8 @@ impl State {
 
     /// Publish current hardware VRR capability and usage to Steam's root
     /// compatibility properties without blocking the Wayland thread.
-    pub fn publish_hardware_vrr(&self, capable: bool, enabled: bool, in_use: bool) {
-        self.steam_worker.publish_vrr(capable, enabled, in_use);
+    pub fn publish_hardware_vrr(&self, capable: bool, in_use: bool) {
+        self.steam_worker.publish_vrr(capable, in_use);
     }
 
     /// Publish the DRM primary-plane decision for runtime verification.
