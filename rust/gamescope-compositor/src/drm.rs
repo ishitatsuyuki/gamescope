@@ -21,6 +21,7 @@ use std::{
 };
 
 use gamescope_core::control::{DisplayPowerOperation, RefreshCycleOverride, ScreenType};
+use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
 use smithay::{
     backend::{
         allocator::{
@@ -59,7 +60,11 @@ use smithay::{
 use smithay_drm_extras::drm_scanner::DrmScanner;
 use tracing::{error, info, warn};
 
-use crate::{CursorLayer, LayerRenderElement, OutputConfig, RenderLayer, State};
+use crate::{
+    CursorLayer, LayerRenderElement, OutputConfig, RenderLayer, State,
+    perfetto::{duration_ns, frame_flow},
+    perfetto_te_ns,
+};
 
 const COLOR_FORMATS: [Fourcc; 4] = [
     Fourcc::Abgr2101010,
@@ -254,6 +259,7 @@ impl HardwareControl {
     /// Replace the unpublished frame. Returns the id of an older frame that was
     /// coalesced, if one existed.
     pub fn submit(&self, frame: HardwareFrame) -> Option<u64> {
+        let frame_id = frame.id;
         let replaced = self
             .shared
             .latest_frame
@@ -261,6 +267,25 @@ impl HardwareControl {
             .expect("DRM frame mailbox poisoned")
             .replace(frame)
             .map(|old| old.id);
+        if let Some(replaced) = replaced {
+            perfetto_sdk::track_event_instant!(
+                "gamescope.frame",
+                "DRM frame coalesced",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg("replaced_frame_id", TrackEventDebugArg::Uint64(replaced));
+                    ctx.add_debug_arg("new_frame_id", TrackEventDebugArg::Uint64(frame_id));
+                    ctx.set_terminating_flow(&frame_flow(replaced, 0));
+                }
+            );
+        }
+        perfetto_sdk::track_event_instant!(
+            "gamescope.frame",
+            "DRM frame mailbox submit",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
+                ctx.set_flow(&frame_flow(frame_id, 0));
+            }
+        );
         self.wake.ping();
         replaced
     }
@@ -704,6 +729,22 @@ impl DrmRuntime {
     }
 
     fn render(&mut self, frame: HardwareFrame) {
+        perfetto_sdk::scoped_track_event!(
+            "gamescope.frame",
+            "DRM prepare and commit frame",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame.id));
+                ctx.add_debug_arg(
+                    "layer_count",
+                    TrackEventDebugArg::Uint64(frame.layers.len() as u64),
+                );
+                ctx.add_debug_arg(
+                    "has_cursor",
+                    TrackEventDebugArg::Bool(frame.cursor.is_some()),
+                );
+                ctx.set_terminating_flow(&frame_flow(frame.id, 0));
+            }
+        );
         let Some(active) = self.active_output.as_mut() else {
             let _ = self
                 .events
@@ -846,13 +887,28 @@ impl DrmRuntime {
             id: frame.id,
             scanout_status,
         };
-        if let Err(error) = active.drm.queue_frame(token)
-            && !matches!(error, FrameError::EmptyFrame)
-        {
-            let _ = self.events.send(HardwareEvent::Error(format!(
-                "DRM frame {} atomic commit failed: {error}",
-                frame.id
-            )));
+        match active.drm.queue_frame(token) {
+            Ok(()) => {
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.frame",
+                    "DRM atomic commit queued",
+                    |ctx: &mut EventContext| {
+                        ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame.id));
+                        ctx.add_debug_arg(
+                            "direct_scanout",
+                            TrackEventDebugArg::Bool(direct_scanout),
+                        );
+                        ctx.set_flow(&frame_flow(frame.id, 1));
+                    }
+                );
+            }
+            Err(FrameError::EmptyFrame) => {}
+            Err(error) => {
+                let _ = self.events.send(HardwareEvent::Error(format!(
+                    "DRM frame {} atomic commit failed: {error}",
+                    frame.id
+                )));
+            }
         }
     }
 
@@ -870,9 +926,25 @@ impl DrmRuntime {
         };
         match active.drm.frame_submitted() {
             Ok(Some(token)) => {
+                let at = Instant::now();
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.frame",
+                    "DRM page flip",
+                    |ctx: &mut EventContext| {
+                        ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(token.id));
+                        ctx.add_debug_arg(
+                            "sequence",
+                            TrackEventDebugArg::Uint64(u64::from(
+                                metadata.map_or(0, |metadata| metadata.sequence),
+                            )),
+                        );
+                        ctx.set_terminating_flow(&frame_flow(token.id, 1));
+                        ctx.set_flow(&frame_flow(token.id, 2));
+                    }
+                );
                 let _ = self.events.send(HardwareEvent::Presented {
                     frame_id: token.id,
-                    at: Instant::now(),
+                    at,
                     monotonic_time: metadata.and_then(|metadata| match metadata.time {
                         DrmEventTime::Monotonic(time) => Some(time),
                         DrmEventTime::Realtime(_) => None,
@@ -1115,13 +1187,29 @@ fn run_worker(
 
     let mut was_paused = false;
     while !shared.shutdown.load(Ordering::Acquire) {
-        if let Err(error) = event_loop.dispatch(None, &mut runtime) {
-            error!(%error, "DRM event loop failed");
-            let _ = events.send(HardwareEvent::Error(format!(
-                "DRM event loop failed: {error}"
-            )));
-            break;
+        {
+            let dispatch_started = Instant::now();
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "DRM worker calloop dispatch",
+                |_| {},
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "elapsed_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    );
+                }
+            );
+            if let Err(error) = event_loop.dispatch(None, &mut runtime) {
+                error!(%error, "DRM event loop failed");
+                let _ = events.send(HardwareEvent::Error(format!(
+                    "DRM event loop failed: {error}"
+                )));
+                break;
+            }
         }
+
+        perfetto_sdk::scoped_track_event!("gamescope.event_loop", "DRM worker wake batch");
 
         let paused = shared.paused.load(Ordering::Acquire);
         if paused != was_paused {

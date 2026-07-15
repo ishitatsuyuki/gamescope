@@ -3,8 +3,11 @@
 #![deny(unsafe_code)]
 
 pub mod drm;
+pub mod perfetto;
 pub mod screenshot;
 pub mod steam;
+
+pub use perfetto::perfetto_te_ns;
 
 use std::{
     borrow::Cow,
@@ -25,6 +28,7 @@ use gamescope_wayland_server::{
     ActiveDisplayInfo, Command, GamescopeHandler, GamescopeState, InputMethodCommand, ServerConfig,
     delegate_gamescope,
 };
+use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
 use smithay::{
     backend::{
         allocator::{Format, dmabuf::Dmabuf},
@@ -101,8 +105,8 @@ use smithay::{
     },
 };
 use steam::{
-    BridgeEvent, FocusCandidate, FocusControl, SteamBridgeWorker, SteamWorkerEvent, WindowMetadata,
-    select_focus, select_managed_ancestor, select_override,
+    BridgeEvent, FocusCandidate, FocusControl, SteamBridgeWorker, SteamWorkerEvent,
+    TimedSteamWorkerEvent, WindowMetadata, select_focus, select_managed_ancestor, select_override,
 };
 use wayland_protocols::{
     wp::presentation_time::server::wp_presentation_feedback, xdg::shell::server::xdg_toplevel,
@@ -442,7 +446,7 @@ pub struct State {
     xwayland_server_ids: HashMap<XwmId, u32>,
     steam_ready_servers: HashSet<u32>,
     steam_worker: SteamBridgeWorker,
-    pending_steam_events: Vec<SteamWorkerEvent>,
+    pending_steam_events: Vec<TimedSteamWorkerEvent>,
     focus_control: FocusControl,
     steam_mode: bool,
     games_running: u32,
@@ -816,12 +820,12 @@ impl State {
     }
 
     /// Move the Steam worker's wakeable event receiver into the compositor loop.
-    pub fn take_steam_event_source(&mut self) -> Option<Channel<SteamWorkerEvent>> {
+    pub fn take_steam_event_source(&mut self) -> Option<Channel<TimedSteamWorkerEvent>> {
         self.steam_worker.take_event_source()
     }
 
     /// Queue one worker event delivered by the compositor event loop.
-    pub fn queue_steam_event(&mut self, event: SteamWorkerEvent) {
+    pub fn queue_steam_event(&mut self, event: TimedSteamWorkerEvent) {
         self.pending_steam_events.push(event);
     }
 
@@ -829,7 +833,18 @@ impl State {
     pub fn process_steam_events(&mut self, serial: Serial) -> Vec<SteamRuntimeRequest> {
         let mut requests = Vec::new();
         let mut focus_dirty = false;
-        for event in std::mem::take(&mut self.pending_steam_events) {
+        for (queued_at, event) in std::mem::take(&mut self.pending_steam_events) {
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.xwm",
+                "Steam worker event delivery",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg("kind", TrackEventDebugArg::String(event.kind()));
+                    ctx.add_debug_arg(
+                        "worker_to_frontend_ns",
+                        TrackEventDebugArg::Uint64(perfetto::duration_ns(queued_at.elapsed())),
+                    );
+                }
+            );
             match event {
                 SteamWorkerEvent::Ready { server_id, initial } => {
                     self.steam_ready_servers.insert(server_id);

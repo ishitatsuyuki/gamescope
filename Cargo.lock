@@ -522,6 +522,8 @@ dependencies = [
  "gamescope-protocols",
  "gamescope-wayland-server",
  "nix",
+ "perfetto-sdk",
+ "perfetto-sdk-sys",
  "png",
  "smithay",
  "smithay-drm-extras",
@@ -1206,10 +1208,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
+
+[[package]]
+name = "perfetto-sdk"
+version = "1.0.3"
+dependencies = [
+ "bitflags 2.13.0",
+ "paste",
+ "perfetto-sdk-sys",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "perfetto-sdk-sys"
+version = "1.2.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "pin-project"

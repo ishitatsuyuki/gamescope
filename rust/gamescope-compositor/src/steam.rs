@@ -17,9 +17,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Instant,
 };
 
 use gamescope_core::control::ScreenType;
+use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
 use smithay::reexports::calloop::{
     EventLoop, Interest, Mode, PostAction, RegistrationToken,
     channel::{self, Channel, Event as ChannelEvent, Sender},
@@ -38,6 +40,8 @@ use x11rb::{
     rust_connection::RustConnection,
     wrapper::ConnectionExt as _,
 };
+
+use crate::{perfetto::duration_ns, perfetto_te_ns};
 
 pub const STEAM_APP_ID: u32 = 769;
 pub const OPAQUE: u32 = u32::MAX;
@@ -297,6 +301,24 @@ pub enum SteamWorkerEvent {
     },
 }
 
+impl SteamWorkerEvent {
+    #[must_use]
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Ready { .. } => "ready",
+            Self::WindowMetadata { .. } => "window_metadata",
+            Self::WindowAncestors { .. } => "window_ancestors",
+            Self::FocusControl { .. } => "focus_control",
+            Self::ScreenScale { .. } => "screen_scale",
+            Self::Event { .. } => "x11_event",
+            Self::Error { .. } => "error",
+        }
+    }
+}
+
+/// Worker publication paired with the instant it entered the calloop channel.
+pub type TimedSteamWorkerEvent = (Instant, SteamWorkerEvent);
+
 #[derive(Clone, Debug)]
 struct FocusPublication {
     focusable_apps: Vec<u32>,
@@ -316,6 +338,7 @@ struct SteamWorkerShared {
     direct_scanout_status: Mutex<Option<u32>>,
     vrr_feedback: Mutex<Option<(bool, bool)>>,
     refresh_millihz: Mutex<Option<i32>>,
+    wake_requested_at: Mutex<Option<Instant>>,
     wake_pending: AtomicBool,
     shutdown: AtomicBool,
 }
@@ -352,13 +375,29 @@ enum SteamWorkerCommand {
     },
 }
 
+impl SteamWorkerCommand {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Wake => "wake",
+            Self::Register { .. } => "register",
+            Self::Remove { .. } => "remove",
+            Self::WatchWindow { .. } => "watch_window",
+            Self::ReadWindow { .. } => "read_window",
+            Self::ResolveWindow { .. } => "resolve_window",
+            Self::CreateFeedback { .. } => "create_feedback",
+        }
+    }
+}
+
+type TimedSteamWorkerCommand = (Instant, SteamWorkerCommand);
+
 /// Blocking X11 property traffic is isolated on the same logical XWM/Main
 /// worker used by Gamescope's policy layer. The Wayland thread only exchanges
 /// snapshots and never waits for an X11 reply.
 pub struct SteamBridgeWorker {
     shared: Arc<SteamWorkerShared>,
-    commands: Sender<SteamWorkerCommand>,
-    events: Option<Channel<SteamWorkerEvent>>,
+    commands: Sender<TimedSteamWorkerCommand>,
+    events: Option<Channel<TimedSteamWorkerEvent>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -435,6 +474,19 @@ impl SteamBridgeWorker {
     /// Gamescope explicitly sets X input focus instead of relying on
     /// WM_TAKE_FOCUS clients to do so. Keep the X request on the XWM worker.
     pub fn set_input_focus(&self, server_id: u32, window: Option<u32>) {
+        perfetto_sdk::track_event_instant!(
+            "gamescope.input",
+            "X11 input focus requested",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg(
+                    "server_id",
+                    TrackEventDebugArg::Uint64(u64::from(server_id)),
+                );
+                if let Some(window) = window {
+                    ctx.add_debug_arg("window", TrackEventDebugArg::Uint64(u64::from(window)));
+                }
+            }
+        );
         self.shared
             .input_focus
             .lock()
@@ -498,16 +550,29 @@ impl SteamBridgeWorker {
     }
 
     fn wake(&self) {
+        self.shared
+            .wake_requested_at
+            .lock()
+            .expect("Steam wake timestamp poisoned")
+            .get_or_insert_with(Instant::now);
         if !self.shared.wake_pending.swap(true, Ordering::AcqRel) {
             self.send_command(SteamWorkerCommand::Wake);
         }
     }
 
     fn send_command(&self, command: SteamWorkerCommand) {
-        let _ = self.commands.send(command);
+        let queued_at = Instant::now();
+        perfetto_sdk::track_event_instant!(
+            "gamescope.xwm",
+            "Steam worker command queued",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg("kind", TrackEventDebugArg::String(command.kind()));
+            }
+        );
+        let _ = self.commands.send((queued_at, command));
     }
 
-    pub fn take_event_source(&mut self) -> Option<Channel<SteamWorkerEvent>> {
+    pub fn take_event_source(&mut self) -> Option<Channel<TimedSteamWorkerEvent>> {
         self.events.take()
     }
 }
@@ -1075,7 +1140,7 @@ fn bridge_initial_state(bridge: &SteamX11Bridge) -> Result<BridgeInitialState, B
 }
 
 fn send_worker_error(
-    events: &Sender<SteamWorkerEvent>,
+    events: &Sender<TimedSteamWorkerEvent>,
     server_id: Option<u32>,
     error: impl ToString,
 ) {
@@ -1088,8 +1153,8 @@ fn send_worker_error(
     );
 }
 
-fn send_worker_event(events: &Sender<SteamWorkerEvent>, event: SteamWorkerEvent) {
-    let _ = events.send(event);
+fn send_worker_event(events: &Sender<TimedSteamWorkerEvent>, event: SteamWorkerEvent) {
+    let _ = events.send((Instant::now(), event));
 }
 
 fn read_worker_window(
@@ -1097,7 +1162,7 @@ fn read_worker_window(
     server_id: u32,
     window: u32,
     pid: Option<u32>,
-    events: &Sender<SteamWorkerEvent>,
+    events: &Sender<TimedSteamWorkerEvent>,
 ) {
     match bridge.read_window(window, pid) {
         Ok(metadata) => {
@@ -1118,7 +1183,7 @@ fn process_worker_command(
     command: SteamWorkerCommand,
     bridges: &mut HashMap<u32, SteamX11Bridge>,
     window_pids: &mut HashMap<(u32, u32), Option<u32>>,
-    events: &Sender<SteamWorkerEvent>,
+    events: &Sender<TimedSteamWorkerEvent>,
 ) {
     match command {
         SteamWorkerCommand::Wake => {}
@@ -1199,7 +1264,7 @@ fn process_worker_state(
     shared: &SteamWorkerShared,
     bridges: &HashMap<u32, SteamX11Bridge>,
     window_pids: &HashMap<(u32, u32), Option<u32>>,
-    events: &Sender<SteamWorkerEvent>,
+    events: &Sender<TimedSteamWorkerEvent>,
 ) -> HashSet<u32> {
     let mut failed_bridges = HashSet::new();
     if let Some(root) = bridges.get(&0) {
@@ -1266,6 +1331,19 @@ fn process_worker_state(
     let mut pending_focus = HashMap::new();
     for (server_id, target) in focus_updates {
         if let Some(bridge) = bridges.get(&server_id) {
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.input",
+                "X11 input focus applied",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "server_id",
+                        TrackEventDebugArg::Uint64(u64::from(server_id)),
+                    );
+                    if let Some(window) = target {
+                        ctx.add_debug_arg("window", TrackEventDebugArg::Uint64(u64::from(window)));
+                    }
+                }
+            );
             if let Err(error) = bridge.set_input_focus(target) {
                 send_worker_error(events, Some(server_id), error);
             }
@@ -1287,6 +1365,20 @@ fn process_worker_state(
         let result = drain_event_batches(
             || bridge.poll_events(),
             |bridge_events| {
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.xwm",
+                    "Steam X11 event batch",
+                    |ctx: &mut EventContext| {
+                        ctx.add_debug_arg(
+                            "server_id",
+                            TrackEventDebugArg::Uint64(u64::from(server_id)),
+                        );
+                        ctx.add_debug_arg(
+                            "event_count",
+                            TrackEventDebugArg::Uint64(bridge_events.len() as u64),
+                        );
+                    }
+                );
                 for event in bridge_events {
                     match event {
                         BridgeEvent::WindowChanged(window) => read_worker_window(
@@ -1358,7 +1450,7 @@ struct SteamWorkerRuntime {
     shared: Arc<SteamWorkerShared>,
     bridges: HashMap<u32, SteamX11Bridge>,
     window_pids: HashMap<(u32, u32), Option<u32>>,
-    events: Sender<SteamWorkerEvent>,
+    events: Sender<TimedSteamWorkerEvent>,
 }
 
 fn synchronize_bridge_sources(
@@ -1401,8 +1493,8 @@ fn synchronize_bridge_sources(
 
 fn run_steam_worker(
     shared: Arc<SteamWorkerShared>,
-    commands: Channel<SteamWorkerCommand>,
-    events: Sender<SteamWorkerEvent>,
+    commands: Channel<TimedSteamWorkerCommand>,
+    events: Sender<TimedSteamWorkerEvent>,
 ) {
     let mut event_loop = match EventLoop::<SteamWorkerRuntime>::try_new() {
         Ok(event_loop) => event_loop,
@@ -1421,12 +1513,25 @@ fn run_steam_worker(
         event_loop
             .handle()
             .insert_source(commands, |event, (), runtime| match event {
-                ChannelEvent::Msg(command) => process_worker_command(
-                    command,
-                    &mut runtime.bridges,
-                    &mut runtime.window_pids,
-                    &runtime.events,
-                ),
+                ChannelEvent::Msg((queued_at, command)) => {
+                    perfetto_sdk::scoped_track_event!(
+                        "gamescope.xwm",
+                        "Steam worker command",
+                        |ctx: &mut EventContext| {
+                            ctx.add_debug_arg("kind", TrackEventDebugArg::String(command.kind()));
+                            ctx.add_debug_arg(
+                                "queue_delay_ns",
+                                TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                            );
+                        }
+                    );
+                    process_worker_command(
+                        command,
+                        &mut runtime.bridges,
+                        &mut runtime.window_pids,
+                        &runtime.events,
+                    );
+                }
                 ChannelEvent::Closed => runtime.shared.shutdown.store(true, Ordering::Release),
             })
     {
@@ -1436,11 +1541,47 @@ fn run_steam_worker(
     let handle = event_loop.handle();
     let mut bridge_tokens = HashMap::new();
     while !shared.shutdown.load(Ordering::Acquire) {
-        if let Err(error) = event_loop.dispatch(None, &mut runtime) {
-            send_worker_error(&runtime.events, None, error);
-            break;
+        {
+            let dispatch_started = Instant::now();
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "Steam worker calloop dispatch",
+                |_| {},
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "elapsed_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    );
+                }
+            );
+            if let Err(error) = event_loop.dispatch(None, &mut runtime) {
+                send_worker_error(&runtime.events, None, error);
+                break;
+            }
         }
         runtime.shared.wake_pending.store(false, Ordering::Release);
+        let wake_requested_at = runtime
+            .shared
+            .wake_requested_at
+            .lock()
+            .expect("Steam wake timestamp poisoned")
+            .take();
+        perfetto_sdk::scoped_track_event!(
+            "gamescope.xwm",
+            "Steam worker state batch",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg(
+                    "bridge_count",
+                    TrackEventDebugArg::Uint64(runtime.bridges.len() as u64),
+                );
+                if let Some(queued_at) = wake_requested_at {
+                    ctx.add_debug_arg(
+                        "mailbox_wake_delay_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    );
+                }
+            }
+        );
         let failed = process_worker_state(
             &runtime.shared,
             &runtime.bridges,

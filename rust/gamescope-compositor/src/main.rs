@@ -17,10 +17,13 @@ use gamescope_compositor::{
         DirectScanoutStatus, HardwareBackend, HardwareConfig, HardwareEvent, HardwareFrame,
         HardwareOutputInfo,
     },
+    perfetto::{duration_ns, frame_flow},
+    perfetto_te_ns,
     steam::{COMMON_COMPAT_ENV, STEAM_COMPAT_ENV},
 };
 use gamescope_core::control::{RefreshCycleOverride, ScreenType};
 use gamescope_wayland_server::{ActiveDisplayInfo, Command as GamescopeCommand, ServerConfig};
+use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
 use smithay::{
     backend::{
         drm::DrmNode,
@@ -437,6 +440,7 @@ fn configure_child_environment(
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    gamescope_compositor::perfetto::init();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -574,24 +578,59 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
     }
     let mut next_xwayland_server_id = u32::try_from(options.xwayland_count)?;
     let frame_due = Rc::new(Cell::new(true));
+    let frame_due_at = Rc::new(Cell::new(Some(Instant::now())));
     let winit_frame_due = Rc::clone(&frame_due);
+    let winit_frame_due_at = Rc::clone(&frame_due_at);
     let winit_events = Rc::new(RefCell::new(VecDeque::new()));
     let pending_winit_events = Rc::clone(&winit_events);
     event_loop
         .handle()
         .insert_source(winit, move |event, (), _state| {
+            let queued_at = Instant::now();
+            perfetto_sdk::track_event_instant!(
+                "gamescope.event_loop",
+                "Nested Winit wake",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "queued_events",
+                        TrackEventDebugArg::Uint64(pending_winit_events.borrow().len() as u64),
+                    );
+                }
+            );
             winit_frame_due.set(true);
-            pending_winit_events.borrow_mut().push_back(event);
+            if winit_frame_due_at.get().is_none() {
+                winit_frame_due_at.set(Some(queued_at));
+            }
+            pending_winit_events
+                .borrow_mut()
+                .push_back((queued_at, event));
         })?;
     let nested_refresh = Duration::from_nanos(
         1_000_000_000_000_u64
             / u64::try_from(output_config.refresh_millihz.max(1)).unwrap_or(60_000),
     );
     let timer_frame_due = Rc::clone(&frame_due);
+    let timer_frame_due_at = Rc::clone(&frame_due_at);
     event_loop.handle().insert_source(
         Timer::from_duration(nested_refresh),
-        move |_, _, _state| {
+        move |deadline, _, _state| {
+            let fired_at = Instant::now();
+            perfetto_sdk::track_event_instant!(
+                "gamescope.frame",
+                "Nested refresh timer",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "timer_late_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(
+                            fired_at.saturating_duration_since(deadline),
+                        )),
+                    );
+                }
+            );
             timer_frame_due.set(true);
+            if timer_frame_due_at.get().is_none() {
+                timer_frame_due_at.set(Some(fired_at));
+            }
             TimeoutAction::ToDuration(nested_refresh)
         },
     )?;
@@ -599,7 +638,31 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
     info!(socket = socket_name, "Rust Gamescope compositor is ready");
 
     loop {
-        event_loop.dispatch(None, &mut state)?;
+        {
+            let dispatch_started = Instant::now();
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "Nested calloop dispatch",
+                |_| {},
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "elapsed_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    );
+                }
+            );
+            event_loop.dispatch(None, &mut state)?;
+        }
+        perfetto_sdk::scoped_track_event!(
+            "gamescope.event_loop",
+            "Nested compositor wake batch",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg(
+                    "winit_queue_depth",
+                    TrackEventDebugArg::Uint64(winit_events.borrow().len() as u64),
+                );
+            }
+        );
         if shutdown.get() {
             info!("shutdown signal received");
             return Ok(());
@@ -632,7 +695,20 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             info!(%status, "primary child exited");
             return Ok(());
         }
-        while let Some(event) = winit_events.borrow_mut().pop_front() {
+        while let Some((queued_at, event)) = winit_events.borrow_mut().pop_front() {
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "Nested Winit event processing",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "queue_delay_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    );
+                }
+            );
+            if matches!(&event, WinitEvent::Input(_)) {
+                perfetto_sdk::track_event_instant!("gamescope.input", "Nested input event");
+            }
             match event {
                 WinitEvent::Input(InputEvent::Keyboard { event }) => {
                     state.bump_input_counter();
@@ -764,6 +840,17 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
         if !frame_due.replace(false) {
             continue;
         }
+        let frame_ready_at = frame_due_at.take().unwrap_or_else(Instant::now);
+        perfetto_sdk::scoped_track_event!(
+            "gamescope.frame",
+            "Nested render and submit",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg(
+                    "ready_to_render_ns",
+                    TrackEventDebugArg::Uint64(duration_ns(frame_ready_at.elapsed())),
+                );
+            }
+        );
 
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
@@ -889,7 +976,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     state.set_limiter_file(limiter_file.path().to_owned());
     let mut event_loop = EventLoop::<State>::try_new()?;
     state.set_loop_handle(event_loop.handle());
-    let hardware_events = Rc::new(RefCell::new(VecDeque::<HardwareEvent>::new()));
+    let hardware_events = Rc::new(RefCell::new(VecDeque::<(Instant, HardwareEvent)>::new()));
     let hardware_event_queue = Rc::clone(&hardware_events);
     let hardware_event_source = hardware
         .take_event_source()
@@ -897,11 +984,17 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     event_loop.handle().insert_source(
         hardware_event_source,
         move |event, (), _state| match event {
-            ChannelEvent::Msg(event) => hardware_event_queue.borrow_mut().push_back(event),
-            ChannelEvent::Closed => {
+            ChannelEvent::Msg(event) => {
+                perfetto_sdk::track_event_instant!("gamescope.event_loop", "DRM worker event wake");
                 hardware_event_queue
                     .borrow_mut()
-                    .push_back(HardwareEvent::Error("DRM worker stopped".into()));
+                    .push_back((Instant::now(), event));
+            }
+            ChannelEvent::Closed => {
+                hardware_event_queue.borrow_mut().push_back((
+                    Instant::now(),
+                    HardwareEvent::Error("DRM worker stopped".into()),
+                ));
             }
         },
     )?;
@@ -1064,7 +1157,38 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             None
         };
         let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
-        event_loop.dispatch(timeout, &mut state)?;
+        {
+            let dispatch_started = Instant::now();
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "DRM frontend calloop dispatch",
+                |ctx: &mut EventContext| {
+                    if let Some(timeout) = timeout {
+                        ctx.add_debug_arg(
+                            "requested_timeout_ns",
+                            TrackEventDebugArg::Uint64(duration_ns(timeout)),
+                        );
+                    }
+                },
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "elapsed_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    );
+                }
+            );
+            event_loop.dispatch(timeout, &mut state)?;
+        }
+        perfetto_sdk::scoped_track_event!(
+            "gamescope.event_loop",
+            "DRM frontend wake batch",
+            |ctx: &mut EventContext| {
+                ctx.add_debug_arg(
+                    "hardware_event_queue_depth",
+                    TrackEventDebugArg::Uint64(hardware_events.borrow().len() as u64),
+                );
+            }
+        );
         if shutdown.get() {
             info!("shutdown signal received");
             return Ok(());
@@ -1172,7 +1296,17 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        while let Some(event) = hardware_events.borrow_mut().pop_front() {
+        while let Some((queued_at, event)) = hardware_events.borrow_mut().pop_front() {
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.event_loop",
+                "DRM worker event processing",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg(
+                        "callback_queue_delay_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    );
+                }
+            );
             match event {
                 HardwareEvent::Presented {
                     frame_id,
@@ -1181,6 +1315,18 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                     sequence,
                     scanout_status,
                 } => {
+                    perfetto_sdk::track_event_instant!(
+                        "gamescope.frame",
+                        "DRM presentation delivered",
+                        |ctx: &mut EventContext| {
+                            ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
+                            ctx.add_debug_arg(
+                                "worker_to_frontend_ns",
+                                TrackEventDebugArg::Uint64(duration_ns(at.elapsed())),
+                            );
+                            ctx.set_terminating_flow(&frame_flow(frame_id, 2));
+                        }
+                    );
                     if frame_in_flight == Some(frame_id) {
                         frame_in_flight = None;
                     }
@@ -1275,6 +1421,19 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         {
             let frame_id = next_frame_id;
             next_frame_id = next_frame_id.wrapping_add(1);
+            perfetto_sdk::scoped_track_event!(
+                "gamescope.frame",
+                "DRM latch and publish frame",
+                |ctx: &mut EventContext| {
+                    ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
+                    ctx.add_debug_arg(
+                        "repaint_late_ns",
+                        TrackEventDebugArg::Uint64(duration_ns(
+                            now.saturating_duration_since(repaint_at),
+                        )),
+                    );
+                }
+            );
             if let Some(replaced) = hardware.submit(HardwareFrame {
                 id: frame_id,
                 layers: state.render_layers(),
@@ -1345,6 +1504,7 @@ fn select_drm_device(
 }
 
 fn process_libinput_event(event: InputEvent<LibinputInputBackend>, state: &mut State) {
+    perfetto_sdk::track_event_instant!("gamescope.input", "Libinput event");
     match event {
         InputEvent::Keyboard { event } => {
             state.bump_input_counter();

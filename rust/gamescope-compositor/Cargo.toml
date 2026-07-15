@@ -16,6 +16,8 @@ gamescope-core = { path = "../gamescope-core" }
 gamescope-wayland-server = { path = "../gamescope-wayland-server" }
 nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 png = "0.18.0"
+perfetto-sdk = { path = "../../../perfetto/contrib/rust-sdk/perfetto" }
+perfetto-sdk-sys = { path = "../../../perfetto/contrib/rust-sdk/perfetto-sys" }
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
     "backend_drm",
