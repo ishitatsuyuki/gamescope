@@ -1,20 +1,16 @@
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     error::Error,
     fs::OpenOptions,
-    os::unix::process::CommandExt as _,
+    os::{fd::AsFd as _, unix::process::CommandExt as _},
     path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio},
     rc::Rc,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use ::winit::platform::pump_events::PumpStatus;
 use gamescope_compositor::{
     ClientState, LayerRenderElement, OutputConfig, State, SteamRuntimeRequest,
     drm::{
@@ -52,7 +48,13 @@ use smithay::{
     input::keyboard::FilterResult,
     reexports::wayland_server::{Display, DisplayHandle, ListeningSocket},
     reexports::{
-        calloop::{EventLoop, LoopHandle, RegistrationToken, channel::Event as ChannelEvent},
+        calloop::{
+            EventLoop, Interest, LoopHandle, Mode, PostAction, RegistrationToken,
+            channel::Event as ChannelEvent,
+            generic::Generic,
+            signals::{Signal, Signals},
+            timer::{TimeoutAction, Timer},
+        },
         input::Libinput,
         rustix::fs::OFlags,
     },
@@ -454,9 +456,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD])?;
+    let shutdown = Rc::new(Cell::new(false));
+    let child_changed = Rc::new(Cell::new(true));
 
     let mut display: Display<State> = Display::new()?;
     let mut handle = display.handle();
@@ -483,7 +485,53 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
         .ok_or("Wayland socket has no UTF-8 name")?
         .to_owned();
 
-    let (mut backend, mut winit) = winit_backend::init::<GlesRenderer>()?;
+    let shutdown_signal = Rc::clone(&shutdown);
+    let child_signal = Rc::clone(&child_changed);
+    event_loop
+        .handle()
+        .insert_source(signals, move |event, (), _state| match event.signal() {
+            Signal::SIGINT | Signal::SIGTERM => shutdown_signal.set(true),
+            Signal::SIGCHLD => child_signal.set(true),
+            _ => {}
+        })?;
+    let listener_ready = Rc::new(Cell::new(true));
+    let listener_wakeup = Rc::clone(&listener_ready);
+    event_loop.handle().insert_source(
+        Generic::new(
+            listener.as_fd().try_clone_to_owned()?,
+            Interest::READ,
+            Mode::Level,
+        ),
+        move |_, _, _state| {
+            listener_wakeup.set(true);
+            Ok(PostAction::Continue)
+        },
+    )?;
+    let display_ready = Rc::new(Cell::new(true));
+    let display_wakeup = Rc::clone(&display_ready);
+    event_loop.handle().insert_source(
+        Generic::new(
+            display.as_fd().try_clone_to_owned()?,
+            Interest::READ,
+            Mode::Level,
+        ),
+        move |_, _, _state| {
+            display_wakeup.set(true);
+            Ok(PostAction::Continue)
+        },
+    )?;
+    let steam_events = state
+        .take_steam_event_source()
+        .ok_or("Steam worker event source was already registered")?;
+    event_loop
+        .handle()
+        .insert_source(steam_events, |event, (), state| {
+            if let ChannelEvent::Msg(event) = event {
+                state.queue_steam_event(event);
+            }
+        })?;
+
+    let (mut backend, winit) = winit_backend::init::<GlesRenderer>()?;
     let requested_size = ::winit::dpi::PhysicalSize::new(window_width, window_height);
     let _ = backend.window().request_inner_size(requested_size);
     if options.borderless || options.fullscreen {
@@ -525,15 +573,37 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
         xwayland_tokens.insert(server_id, token);
     }
     let mut next_xwayland_server_id = u32::try_from(options.xwayland_count)?;
+    let frame_due = Rc::new(Cell::new(true));
+    let winit_frame_due = Rc::clone(&frame_due);
+    let winit_events = Rc::new(RefCell::new(VecDeque::new()));
+    let pending_winit_events = Rc::clone(&winit_events);
+    event_loop
+        .handle()
+        .insert_source(winit, move |event, (), _state| {
+            winit_frame_due.set(true);
+            pending_winit_events.borrow_mut().push_back(event);
+        })?;
+    let nested_refresh = Duration::from_nanos(
+        1_000_000_000_000_u64
+            / u64::try_from(output_config.refresh_millihz.max(1)).unwrap_or(60_000),
+    );
+    let timer_frame_due = Rc::clone(&frame_due);
+    event_loop.handle().insert_source(
+        Timer::from_duration(nested_refresh),
+        move |_, _, _state| {
+            timer_frame_due.set(true);
+            TimeoutAction::ToDuration(nested_refresh)
+        },
+    )?;
 
     info!(socket = socket_name, "Rust Gamescope compositor is ready");
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
+        event_loop.dispatch(None, &mut state)?;
+        if shutdown.get() {
             info!("shutdown signal received");
             return Ok(());
         }
-        event_loop.dispatch(Some(Duration::ZERO), &mut state)?;
         if pending_command.is_some() && state.ready_xwayland_count() >= options.xwayland_count {
             let command = pending_command.take().expect("command checked above");
             let (program, arguments) = command.split_first().expect("non-empty command");
@@ -550,8 +620,10 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 child.env("DISPLAY", format!(":{display_number}"));
             }
             primary_child = Some(ManagedChild(child.spawn()?));
+            child_changed.set(true);
         }
-        if !options.keep_alive
+        if child_changed.replace(false)
+            && !options.keep_alive
             && let Some(status) = primary_child
                 .as_mut()
                 .and_then(|child| child.try_wait().transpose())
@@ -560,75 +632,85 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             info!(%status, "primary child exited");
             return Ok(());
         }
-        let status = winit.dispatch_new_events(|event| match event {
-            WinitEvent::Input(InputEvent::Keyboard { event }) => {
-                state.bump_input_counter();
-                if let Some(keyboard) = state.seat.get_keyboard() {
-                    let timestamp =
-                        u32::try_from(state.started_at.elapsed().as_millis()).unwrap_or(u32::MAX);
-                    let key_state = event.state();
-                    let monotonic_time_ns =
-                        u64::try_from(state.started_at.elapsed().as_nanos()).unwrap_or(u64::MAX);
-                    keyboard.input::<(), _>(
-                        &mut state,
-                        event.key_code(),
-                        key_state,
+        while let Some(event) = winit_events.borrow_mut().pop_front() {
+            match event {
+                WinitEvent::Input(InputEvent::Keyboard { event }) => {
+                    state.bump_input_counter();
+                    if let Some(keyboard) = state.seat.get_keyboard() {
+                        let timestamp = u32::try_from(state.started_at.elapsed().as_millis())
+                            .unwrap_or(u32::MAX);
+                        let key_state = event.state();
+                        let monotonic_time_ns =
+                            u64::try_from(state.started_at.elapsed().as_nanos())
+                                .unwrap_or(u64::MAX);
+                        keyboard.input::<(), _>(
+                            &mut state,
+                            event.key_code(),
+                            key_state,
+                            Serial::from(serial),
+                            timestamp,
+                            |state, _, key| state.filter_key(key_state, &key, monotonic_time_ns),
+                        );
+                        serial = serial.wrapping_add(1);
+                    }
+                }
+                WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
+                    state.bump_input_counter();
+                    state.refresh_focus(Serial::from(serial));
+                    serial = serial.wrapping_add(1);
+                    if let Some(mode) = state.output.current_mode() {
+                        let location = state.transform_pointer_for_global_scale((
+                            event.x_transformed(mode.size.w),
+                            event.y_transformed(mode.size.h),
+                        ));
+                        state.pointer_motion(
+                            location.into(),
+                            Serial::from(serial),
+                            event.time_msec(),
+                        );
+                        serial = serial.wrapping_add(1);
+                    }
+                }
+                WinitEvent::Input(InputEvent::PointerButton { event }) => {
+                    state.bump_input_counter();
+                    state.pointer_button(
+                        event.button_code(),
+                        event.state() == smithay::backend::input::ButtonState::Pressed,
                         Serial::from(serial),
-                        timestamp,
-                        |state, _, key| state.filter_key(key_state, &key, monotonic_time_ns),
+                        event.time_msec(),
                     );
                     serial = serial.wrapping_add(1);
                 }
-            }
-            WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
-                state.bump_input_counter();
-                state.refresh_focus(Serial::from(serial));
-                serial = serial.wrapping_add(1);
-                if let Some(mode) = state.output.current_mode() {
-                    let location = state.transform_pointer_for_global_scale((
-                        event.x_transformed(mode.size.w),
-                        event.y_transformed(mode.size.h),
-                    ));
-                    state.pointer_motion(location.into(), Serial::from(serial), event.time_msec());
-                    serial = serial.wrapping_add(1);
+                WinitEvent::Input(InputEvent::PointerAxis { event }) => {
+                    state.bump_input_counter();
+                    let horizontal = event
+                        .amount_v120(Axis::Horizontal)
+                        .map(|value| value / 120.0)
+                        .or_else(|| event.amount(Axis::Horizontal).map(|value| value / 15.0))
+                        .unwrap_or_default();
+                    let vertical = event
+                        .amount_v120(Axis::Vertical)
+                        .map(|value| value / 120.0)
+                        .or_else(|| event.amount(Axis::Vertical).map(|value| value / 15.0))
+                        .unwrap_or_default();
+                    state.pointer_wheel(horizontal, vertical, event.time_msec());
                 }
+                WinitEvent::CloseRequested => return Ok(()),
+                _ => {}
             }
-            WinitEvent::Input(InputEvent::PointerButton { event }) => {
-                state.bump_input_counter();
-                state.pointer_button(
-                    event.button_code(),
-                    event.state() == smithay::backend::input::ButtonState::Pressed,
-                    Serial::from(serial),
-                    event.time_msec(),
-                );
-                serial = serial.wrapping_add(1);
-            }
-            WinitEvent::Input(InputEvent::PointerAxis { event }) => {
-                state.bump_input_counter();
-                let horizontal = event
-                    .amount_v120(Axis::Horizontal)
-                    .map(|value| value / 120.0)
-                    .or_else(|| event.amount(Axis::Horizontal).map(|value| value / 15.0))
-                    .unwrap_or_default();
-                let vertical = event
-                    .amount_v120(Axis::Vertical)
-                    .map(|value| value / 120.0)
-                    .or_else(|| event.amount(Axis::Vertical).map(|value| value / 15.0))
-                    .unwrap_or_default();
-                state.pointer_wheel(horizontal, vertical, event.time_msec());
-            }
-            _ => {}
-        });
-        if matches!(status, PumpStatus::Exit(_)) {
-            return Ok(());
         }
 
-        while let Some(stream) = listener.accept()? {
-            let data: Arc<dyn ClientData> = Arc::new(ClientState::default());
-            clients.push(handle.insert_client(stream, data)?);
+        if listener_ready.replace(false) {
+            while let Some(stream) = listener.accept()? {
+                let data: Arc<dyn ClientData> = Arc::new(ClientState::default());
+                clients.push(handle.insert_client(stream, data)?);
+                display_ready.set(true);
+            }
         }
 
-        display.dispatch_clients(&mut state)?;
+        if display_ready.replace(false) {
+            display.dispatch_clients(&mut state)?;
+        }
         for command in state.process_gamescope_commands(&mut serial) {
             debug!(?command, "command is unavailable on the nested backend");
         }
@@ -678,8 +760,10 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        state.update_timers();
         display.flush_clients()?;
+        if !frame_due.replace(false) {
+            continue;
+        }
 
         let size = backend.window_size();
         let damage = Rectangle::from_size(size);
@@ -758,9 +842,9 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
 
 #[allow(clippy::too_many_lines)]
 fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
-    let shutdown = Arc::new(AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&shutdown))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&shutdown))?;
+    let signals = Signals::new(&[Signal::SIGINT, Signal::SIGTERM, Signal::SIGCHLD])?;
+    let shutdown = Rc::new(Cell::new(false));
+    let child_changed = Rc::new(Cell::new(true));
 
     let (mut session, session_notifier) = LibSeatSession::new()?;
     let (udev, drm_path, drm_device_id) = select_drm_device(&options, &session)?;
@@ -831,6 +915,52 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         .and_then(|name| name.to_str())
         .ok_or("Wayland socket has no UTF-8 name")?
         .to_owned();
+
+    let shutdown_signal = Rc::clone(&shutdown);
+    let child_signal = Rc::clone(&child_changed);
+    event_loop
+        .handle()
+        .insert_source(signals, move |event, (), _state| match event.signal() {
+            Signal::SIGINT | Signal::SIGTERM => shutdown_signal.set(true),
+            Signal::SIGCHLD => child_signal.set(true),
+            _ => {}
+        })?;
+    let listener_ready = Rc::new(Cell::new(true));
+    let listener_wakeup = Rc::clone(&listener_ready);
+    event_loop.handle().insert_source(
+        Generic::new(
+            listener.as_fd().try_clone_to_owned()?,
+            Interest::READ,
+            Mode::Level,
+        ),
+        move |_, _, _state| {
+            listener_wakeup.set(true);
+            Ok(PostAction::Continue)
+        },
+    )?;
+    let display_ready = Rc::new(Cell::new(true));
+    let display_wakeup = Rc::clone(&display_ready);
+    event_loop.handle().insert_source(
+        Generic::new(
+            display.as_fd().try_clone_to_owned()?,
+            Interest::READ,
+            Mode::Level,
+        ),
+        move |_, _, _state| {
+            display_wakeup.set(true);
+            Ok(PostAction::Continue)
+        },
+    )?;
+    let steam_events = state
+        .take_steam_event_source()
+        .ok_or("Steam worker event source was already registered")?;
+    event_loop
+        .handle()
+        .insert_source(steam_events, |event, (), state| {
+            if let ChannelEvent::Msg(event) = event {
+                state.queue_steam_event(event);
+            }
+        })?;
 
     state.publish_hardware_vrr(physical_output.vrr_capable, physical_output.vrr_enabled);
 
@@ -925,10 +1055,6 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     );
 
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            info!("shutdown signal received");
-            return Ok(());
-        }
         let now = Instant::now();
         let deadline = if idle_present_at.is_some() {
             idle_present_at
@@ -937,11 +1063,12 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
         } else {
             None
         };
-        let timeout = deadline
-            .map(|deadline| deadline.saturating_duration_since(now))
-            .unwrap_or(Duration::from_millis(2))
-            .min(Duration::from_millis(2));
-        event_loop.dispatch(Some(timeout), &mut state)?;
+        let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
+        event_loop.dispatch(timeout, &mut state)?;
+        if shutdown.get() {
+            info!("shutdown signal received");
+            return Ok(());
+        }
         if let Some(vt) = state.take_vt_switch() {
             info!(vt, "switching virtual terminal");
             if let Err(error) = session.change_vt(vt) {
@@ -964,8 +1091,10 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 child.env("DISPLAY", format!(":{display_number}"));
             }
             primary_child = Some(ManagedChild(child.spawn()?));
+            child_changed.set(true);
         }
-        if !options.keep_alive
+        if child_changed.replace(false)
+            && !options.keep_alive
             && let Some(status) = primary_child
                 .as_mut()
                 .and_then(|child| child.try_wait().transpose())
@@ -975,11 +1104,16 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
 
-        while let Some(stream) = listener.accept()? {
-            let data: Arc<dyn ClientData> = Arc::new(ClientState::default());
-            clients.push(handle.insert_client(stream, data)?);
+        if listener_ready.replace(false) {
+            while let Some(stream) = listener.accept()? {
+                let data: Arc<dyn ClientData> = Arc::new(ClientState::default());
+                clients.push(handle.insert_client(stream, data)?);
+                display_ready.set(true);
+            }
         }
-        display.dispatch_clients(&mut state)?;
+        if display_ready.replace(false) {
+            display.dispatch_clients(&mut state)?;
+        }
         for command in state.process_gamescope_commands(&mut serial) {
             match command {
                 GamescopeCommand::SetRefreshCycle(request) => {
@@ -1038,8 +1172,6 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 }
             }
         }
-        state.update_timers();
-
         while let Some(event) = hardware_events.borrow_mut().pop_front() {
             match event {
                 HardwareEvent::Presented {
@@ -1134,7 +1266,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
                     | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock,
             );
-            repaint_at = now + Duration::from_millis(1);
+            repaint_at = now;
         }
         if !output_asleep
             && frame_in_flight.is_none()

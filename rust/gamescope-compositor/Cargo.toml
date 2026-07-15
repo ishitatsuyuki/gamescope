@@ -11,11 +11,11 @@ name = "gamescope-rs"
 path = "src/main.rs"
 
 [dependencies]
+calloop = { version = "0.14.4", features = ["signals"] }
 gamescope-core = { path = "../gamescope-core" }
 gamescope-wayland-server = { path = "../gamescope-wayland-server" }
 nix = { version = "0.31.1", default-features = false, features = ["signal"] }
 png = "0.18.0"
-signal-hook = "0.3.18"
 smithay = { version = "0.7.0", default-features = false, features = [
     "backend_winit",
     "backend_drm",

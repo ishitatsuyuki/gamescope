@@ -56,7 +56,11 @@ use smithay::{
         },
     },
     output::{Mode as OutputMode, Output, PhysicalProperties, Scale, Subpixel},
-    reexports::calloop::LoopHandle,
+    reexports::calloop::{
+        LoopHandle, RegistrationToken,
+        channel::Channel,
+        timer::{TimeoutAction, Timer},
+    },
     utils::{
         Buffer, IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Serial, Transform,
     },
@@ -431,13 +435,14 @@ pub struct State {
     pressed_keysyms: Vec<u32>,
     pressed_evdev_keys: HashSet<u32>,
     intercepted_vt_keys: HashSet<u32>,
-    ime_reset_deadline: Option<Instant>,
+    ime_reset_timer: Option<RegistrationToken>,
     x11_windows: Vec<X11Surface>,
     x11_window_metadata: HashMap<(XwmId, u32), WindowMetadata>,
     x11_window_sequences: HashMap<(XwmId, u32), u64>,
     xwayland_server_ids: HashMap<XwmId, u32>,
     steam_ready_servers: HashSet<u32>,
     steam_worker: SteamBridgeWorker,
+    pending_steam_events: Vec<SteamWorkerEvent>,
     focus_control: FocusControl,
     steam_mode: bool,
     games_running: u32,
@@ -578,13 +583,14 @@ impl State {
             pressed_keysyms: Vec::new(),
             pressed_evdev_keys: HashSet::new(),
             intercepted_vt_keys: HashSet::new(),
-            ime_reset_deadline: None,
+            ime_reset_timer: None,
             x11_windows: Vec::new(),
             x11_window_metadata: HashMap::new(),
             x11_window_sequences: HashMap::new(),
             xwayland_server_ids: HashMap::new(),
             steam_ready_servers: HashSet::new(),
             steam_worker: SteamBridgeWorker::spawn(),
+            pending_steam_events: Vec::new(),
             focus_control: FocusControl::default(),
             steam_mode,
             games_running: 0,
@@ -809,11 +815,21 @@ impl State {
         );
     }
 
-    /// Poll Steam's X11 property channel and return process-lifecycle work.
+    /// Move the Steam worker's wakeable event receiver into the compositor loop.
+    pub fn take_steam_event_source(&mut self) -> Option<Channel<SteamWorkerEvent>> {
+        self.steam_worker.take_event_source()
+    }
+
+    /// Queue one worker event delivered by the compositor event loop.
+    pub fn queue_steam_event(&mut self, event: SteamWorkerEvent) {
+        self.pending_steam_events.push(event);
+    }
+
+    /// Process queued Steam X11 events and return process-lifecycle work.
     pub fn process_steam_events(&mut self, serial: Serial) -> Vec<SteamRuntimeRequest> {
         let mut requests = Vec::new();
         let mut focus_dirty = false;
-        for event in self.steam_worker.drain_events() {
+        for event in std::mem::take(&mut self.pending_steam_events) {
             match event {
                 SteamWorkerEvent::Ready { server_id, initial } => {
                     self.steam_ready_servers.insert(server_id);
@@ -878,19 +894,25 @@ impl State {
                         );
                     }
                 }
-                SteamWorkerEvent::FocusControl { server_id, control } if server_id == 0 => {
+                SteamWorkerEvent::FocusControl {
+                    server_id: 0,
+                    control,
+                } => {
                     self.focus_control = control;
                     focus_dirty = true;
                 }
                 SteamWorkerEvent::ScreenScale {
-                    server_id,
+                    server_id: 0,
                     scale,
                     magnification,
-                } if server_id == 0 => {
+                } => {
                     self.overscan_scale = scale;
                     self.zoom_scale = magnification;
                 }
-                SteamWorkerEvent::Event { server_id, event } if server_id == 0 => match event {
+                SteamWorkerEvent::Event {
+                    server_id: 0,
+                    event,
+                } => match event {
                     BridgeEvent::CreateXwayland(identifier) => {
                         requests.push(SteamRuntimeRequest::CreateXwayland { identifier });
                     }
@@ -1924,17 +1946,25 @@ impl State {
         backend_commands
     }
 
-    /// Restore the regular seat keymap after the IME compatibility delay.
-    pub fn update_timers(&mut self) {
-        if self
-            .ime_reset_deadline
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            self.ime_reset_deadline = None;
-            if let Some(keyboard) = self.seat.get_keyboard() {
-                let _ = keyboard.set_xkb_config(self, XkbConfig::default());
-            }
+    fn schedule_ime_reset(&mut self) {
+        let Some(handle) = self.loop_handle.clone() else {
+            return;
+        };
+        if let Some(token) = self.ime_reset_timer.take() {
+            handle.remove(token);
         }
+        self.ime_reset_timer = handle
+            .insert_source(
+                Timer::from_duration(Duration::from_millis(100)),
+                |_, _, state| {
+                    state.ime_reset_timer = None;
+                    if let Some(keyboard) = state.seat.get_keyboard() {
+                        let _ = keyboard.set_xkb_config(state, XkbConfig::default());
+                    }
+                    TimeoutAction::Drop
+                },
+            )
+            .ok();
     }
 
     fn process_input_method(&mut self, command: InputMethodCommand, serial: &mut u32) {
@@ -1989,7 +2019,7 @@ impl State {
                         |_, _, _| FilterResult::Forward,
                     );
                 }
-                self.ime_reset_deadline = Some(Instant::now() + Duration::from_millis(100));
+                self.schedule_ime_reset();
             }
         }
         if let Some(keycode) = action_keycode(commit.action) {

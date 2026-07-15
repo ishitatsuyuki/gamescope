@@ -9,17 +9,22 @@ use std::{
     cell::Cell,
     collections::{HashMap, HashSet},
     error::Error,
-    fs, process,
+    fs,
+    os::fd::{AsFd as _, OwnedFd},
+    process,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 use gamescope_core::control::ScreenType;
+use smithay::reexports::calloop::{
+    EventLoop, Interest, Mode, PostAction, RegistrationToken,
+    channel::{self, Channel, Event as ChannelEvent, Sender},
+    generic::Generic,
+};
 use x11rb::{
     connection::Connection,
     protocol::{
@@ -311,11 +316,13 @@ struct SteamWorkerShared {
     direct_scanout_status: Mutex<Option<u32>>,
     vrr_feedback: Mutex<Option<(bool, bool)>>,
     refresh_millihz: Mutex<Option<i32>>,
+    wake_pending: AtomicBool,
     shutdown: AtomicBool,
 }
 
 #[derive(Debug)]
 enum SteamWorkerCommand {
+    Wake,
     Register {
         display_number: u32,
         server_id: u32,
@@ -351,7 +358,7 @@ enum SteamWorkerCommand {
 pub struct SteamBridgeWorker {
     shared: Arc<SteamWorkerShared>,
     commands: Sender<SteamWorkerCommand>,
-    events: Receiver<SteamWorkerEvent>,
+    events: Option<Channel<SteamWorkerEvent>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -359,8 +366,8 @@ impl SteamBridgeWorker {
     #[must_use]
     pub fn spawn() -> Self {
         let shared = Arc::new(SteamWorkerShared::default());
-        let (commands, command_rx) = mpsc::channel();
-        let (event_tx, events) = mpsc::channel();
+        let (commands, command_rx) = channel::channel();
+        let (event_tx, events) = channel::channel();
         let worker_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
             .name("gamescope-xwm".into())
@@ -369,13 +376,13 @@ impl SteamBridgeWorker {
         Self {
             shared,
             commands,
-            events,
+            events: Some(events),
             thread: Some(thread),
         }
     }
 
     pub fn register(&self, display_number: u32, server_id: u32, refresh_millihz: i32) {
-        let _ = self.commands.send(SteamWorkerCommand::Register {
+        self.send_command(SteamWorkerCommand::Register {
             display_number,
             server_id,
             refresh_millihz,
@@ -383,11 +390,11 @@ impl SteamBridgeWorker {
     }
 
     pub fn remove(&self, server_id: u32) {
-        let _ = self.commands.send(SteamWorkerCommand::Remove { server_id });
+        self.send_command(SteamWorkerCommand::Remove { server_id });
     }
 
     pub fn watch_window(&self, server_id: u32, window: u32, pid: Option<u32>) {
-        let _ = self.commands.send(SteamWorkerCommand::WatchWindow {
+        self.send_command(SteamWorkerCommand::WatchWindow {
             server_id,
             window,
             pid,
@@ -395,7 +402,7 @@ impl SteamBridgeWorker {
     }
 
     pub fn read_window(&self, server_id: u32, window: u32, pid: Option<u32>) {
-        let _ = self.commands.send(SteamWorkerCommand::ReadWindow {
+        self.send_command(SteamWorkerCommand::ReadWindow {
             server_id,
             window,
             pid,
@@ -405,13 +412,11 @@ impl SteamBridgeWorker {
     /// Resolve a Vulkan drawable's X11 parent chain on the isolated XWM
     /// worker, never on the latency-sensitive Wayland thread.
     pub fn resolve_window(&self, server_id: u32, window: u32) {
-        let _ = self
-            .commands
-            .send(SteamWorkerCommand::ResolveWindow { server_id, window });
+        self.send_command(SteamWorkerCommand::ResolveWindow { server_id, window });
     }
 
     pub fn publish_create_feedback(&self, identifier: u32, server_id: u32, display_name: String) {
-        let _ = self.commands.send(SteamWorkerCommand::CreateFeedback {
+        self.send_command(SteamWorkerCommand::CreateFeedback {
             identifier,
             server_id,
             display_name,
@@ -424,6 +429,7 @@ impl SteamBridgeWorker {
             .input_counter
             .lock()
             .expect("Steam input-counter mailbox poisoned") = Some(counter);
+        self.wake();
     }
 
     /// Gamescope explicitly sets X input focus instead of relying on
@@ -434,6 +440,7 @@ impl SteamBridgeWorker {
             .lock()
             .expect("Steam input-focus mailbox poisoned")
             .insert(server_id, window);
+        self.wake();
     }
 
     pub fn publish_vrr(&self, capable: bool, in_use: bool) {
@@ -442,6 +449,7 @@ impl SteamBridgeWorker {
             .vrr_feedback
             .lock()
             .expect("Steam VRR mailbox poisoned") = Some((capable, in_use));
+        self.wake();
     }
 
     pub fn publish_direct_scanout_status(&self, status: u32) {
@@ -450,6 +458,7 @@ impl SteamBridgeWorker {
             .direct_scanout_status
             .lock()
             .expect("direct-scanout status mailbox poisoned") = Some(status);
+        self.wake();
     }
 
     pub fn publish_refresh(&self, refresh_millihz: i32) {
@@ -458,6 +467,7 @@ impl SteamBridgeWorker {
             .refresh_millihz
             .lock()
             .expect("Steam refresh mailbox poisoned") = Some(refresh_millihz);
+        self.wake();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -484,16 +494,28 @@ impl SteamBridgeWorker {
             focus_display,
             steam_mode,
         });
+        self.wake();
     }
 
-    pub fn drain_events(&self) -> Vec<SteamWorkerEvent> {
-        self.events.try_iter().collect()
+    fn wake(&self) {
+        if !self.shared.wake_pending.swap(true, Ordering::AcqRel) {
+            self.send_command(SteamWorkerCommand::Wake);
+        }
+    }
+
+    fn send_command(&self, command: SteamWorkerCommand) {
+        let _ = self.commands.send(command);
+    }
+
+    pub fn take_event_source(&mut self) -> Option<Channel<SteamWorkerEvent>> {
+        self.events.take()
     }
 }
 
 impl Drop for SteamBridgeWorker {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
+        self.send_command(SteamWorkerCommand::Wake);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -688,6 +710,10 @@ impl SteamX11Bridge {
         bridge.set_cardinal(bridge.atoms.refresh_feedback, &[refresh_hz])?;
         bridge.connection.flush()?;
         Ok(bridge)
+    }
+
+    fn event_fd(&self) -> std::io::Result<OwnedFd> {
+        self.connection.stream().as_fd().try_clone_to_owned()
     }
 
     #[must_use]
@@ -890,6 +916,7 @@ impl SteamX11Bridge {
         Ok(events)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn publish_focus(
         &self,
         focusable_apps: &[u32],
@@ -1052,10 +1079,17 @@ fn send_worker_error(
     server_id: Option<u32>,
     error: impl ToString,
 ) {
-    let _ = events.send(SteamWorkerEvent::Error {
-        server_id,
-        message: error.to_string(),
-    });
+    send_worker_event(
+        events,
+        SteamWorkerEvent::Error {
+            server_id,
+            message: error.to_string(),
+        },
+    );
+}
+
+fn send_worker_event(events: &Sender<SteamWorkerEvent>, event: SteamWorkerEvent) {
+    let _ = events.send(event);
 }
 
 fn read_worker_window(
@@ -1067,11 +1101,14 @@ fn read_worker_window(
 ) {
     match bridge.read_window(window, pid) {
         Ok(metadata) => {
-            let _ = events.send(SteamWorkerEvent::WindowMetadata {
-                server_id,
-                window,
-                metadata,
-            });
+            send_worker_event(
+                events,
+                SteamWorkerEvent::WindowMetadata {
+                    server_id,
+                    window,
+                    metadata,
+                },
+            );
         }
         Err(error) => send_worker_error(events, Some(server_id), error),
     }
@@ -1084,6 +1121,7 @@ fn process_worker_command(
     events: &Sender<SteamWorkerEvent>,
 ) {
     match command {
+        SteamWorkerCommand::Wake => {}
         SteamWorkerCommand::Register {
             display_number,
             server_id,
@@ -1092,7 +1130,7 @@ fn process_worker_command(
             Ok(bridge) => match bridge_initial_state(&bridge) {
                 Ok(initial) => {
                     bridges.insert(server_id, bridge);
-                    let _ = events.send(SteamWorkerEvent::Ready { server_id, initial });
+                    send_worker_event(events, SteamWorkerEvent::Ready { server_id, initial });
                 }
                 Err(error) => send_worker_error(events, Some(server_id), error),
             },
@@ -1129,11 +1167,14 @@ fn process_worker_command(
             if let Some(bridge) = bridges.get(&server_id) {
                 match bridge.window_ancestors(window) {
                     Ok(ancestors) => {
-                        let _ = events.send(SteamWorkerEvent::WindowAncestors {
-                            server_id,
-                            window,
-                            ancestors,
-                        });
+                        send_worker_event(
+                            events,
+                            SteamWorkerEvent::WindowAncestors {
+                                server_id,
+                                window,
+                                ancestors,
+                            },
+                        );
                     }
                     Err(error) => send_worker_error(events, Some(server_id), error),
                 }
@@ -1154,150 +1195,265 @@ fn process_worker_command(
     }
 }
 
-fn run_steam_worker(
-    shared: Arc<SteamWorkerShared>,
-    commands: Receiver<SteamWorkerCommand>,
-    events: Sender<SteamWorkerEvent>,
-) {
-    let mut bridges = HashMap::<u32, SteamX11Bridge>::new();
-    let mut window_pids = HashMap::<(u32, u32), Option<u32>>::new();
-    while !shared.shutdown.load(Ordering::Acquire) {
-        match commands.recv_timeout(Duration::from_millis(2)) {
-            Ok(command) => {
-                process_worker_command(command, &mut bridges, &mut window_pids, &events);
-                while let Ok(command) = commands.try_recv() {
-                    process_worker_command(command, &mut bridges, &mut window_pids, &events);
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+fn process_worker_state(
+    shared: &SteamWorkerShared,
+    bridges: &HashMap<u32, SteamX11Bridge>,
+    window_pids: &HashMap<(u32, u32), Option<u32>>,
+    events: &Sender<SteamWorkerEvent>,
+) -> HashSet<u32> {
+    let mut failed_bridges = HashSet::new();
+    if let Some(root) = bridges.get(&0) {
+        if let Some(publication) = shared
+            .focus
+            .lock()
+            .expect("Steam focus mailbox poisoned")
+            .take()
+            && let Err(error) = root.publish_focus(
+                &publication.focusable_apps,
+                &publication.focusable_windows,
+                publication.focused_window,
+                publication.focused_app,
+                publication.focused_gfx_app,
+                &publication.focus_display,
+                publication.steam_mode,
+            )
+        {
+            send_worker_error(events, Some(0), error);
         }
-
-        if let Some(root) = bridges.get(&0) {
-            if let Some(publication) = shared
-                .focus
-                .lock()
-                .expect("Steam focus mailbox poisoned")
-                .take()
-                && let Err(error) = root.publish_focus(
-                    &publication.focusable_apps,
-                    &publication.focusable_windows,
-                    publication.focused_window,
-                    publication.focused_app,
-                    publication.focused_gfx_app,
-                    &publication.focus_display,
-                    publication.steam_mode,
-                )
-            {
-                send_worker_error(&events, Some(0), error);
-            }
-            if let Some(counter) = shared
-                .input_counter
-                .lock()
-                .expect("Steam input-counter mailbox poisoned")
-                .take()
-                && let Err(error) = root.publish_input_counter(counter)
-            {
-                send_worker_error(&events, Some(0), error);
-            }
-            if let Some(status) = shared
-                .direct_scanout_status
-                .lock()
-                .expect("direct-scanout status mailbox poisoned")
-                .take()
-                && let Err(error) = root.publish_direct_scanout_status(status)
-            {
-                send_worker_error(&events, Some(0), error);
-            }
-            if let Some((capable, in_use)) = shared
-                .vrr_feedback
-                .lock()
-                .expect("Steam VRR mailbox poisoned")
-                .take()
-                && let Err(error) = root.publish_vrr(capable, in_use)
-            {
-                send_worker_error(&events, Some(0), error);
-            }
-            if let Some(refresh_millihz) = shared
-                .refresh_millihz
-                .lock()
-                .expect("Steam refresh mailbox poisoned")
-                .take()
-                && let Err(error) = root.publish_refresh(refresh_millihz)
-            {
-                send_worker_error(&events, Some(0), error);
-            }
+        if let Some(counter) = shared
+            .input_counter
+            .lock()
+            .expect("Steam input-counter mailbox poisoned")
+            .take()
+            && let Err(error) = root.publish_input_counter(counter)
+        {
+            send_worker_error(events, Some(0), error);
         }
-        let focus_updates = std::mem::take(
-            &mut *shared
-                .input_focus
-                .lock()
-                .expect("Steam input-focus mailbox poisoned"),
-        );
-        let mut pending_focus = HashMap::new();
-        for (server_id, target) in focus_updates {
-            if let Some(bridge) = bridges.get(&server_id)
-                && let Err(error) = bridge.set_input_focus(target)
-            {
-                send_worker_error(&events, Some(server_id), error);
-            } else if !bridges.contains_key(&server_id) {
-                pending_focus.insert(server_id, target);
-            }
+        if let Some(status) = shared
+            .direct_scanout_status
+            .lock()
+            .expect("direct-scanout status mailbox poisoned")
+            .take()
+            && let Err(error) = root.publish_direct_scanout_status(status)
+        {
+            send_worker_error(events, Some(0), error);
         }
-        shared
+        if let Some((capable, in_use)) = shared
+            .vrr_feedback
+            .lock()
+            .expect("Steam VRR mailbox poisoned")
+            .take()
+            && let Err(error) = root.publish_vrr(capable, in_use)
+        {
+            send_worker_error(events, Some(0), error);
+        }
+        if let Some(refresh_millihz) = shared
+            .refresh_millihz
+            .lock()
+            .expect("Steam refresh mailbox poisoned")
+            .take()
+            && let Err(error) = root.publish_refresh(refresh_millihz)
+        {
+            send_worker_error(events, Some(0), error);
+        }
+    }
+    let focus_updates = std::mem::take(
+        &mut *shared
             .input_focus
             .lock()
-            .expect("Steam input-focus mailbox poisoned")
-            .extend(pending_focus);
-
-        for (&server_id, bridge) in &bridges {
-            let bridge_events = match bridge.poll_events() {
-                Ok(events) => events,
-                Err(error) => {
-                    send_worker_error(&events, Some(server_id), error);
-                    continue;
-                }
-            };
-            for event in bridge_events {
-                match event {
-                    BridgeEvent::WindowChanged(window) => read_worker_window(
-                        bridge,
-                        server_id,
-                        window,
-                        window_pids.get(&(server_id, window)).copied().flatten(),
-                        &events,
-                    ),
-                    BridgeEvent::FocusControlChanged => match bridge.focus_control() {
-                        Ok(control) => {
-                            let _ =
-                                events.send(SteamWorkerEvent::FocusControl { server_id, control });
-                        }
-                        Err(error) => send_worker_error(&events, Some(server_id), error),
-                    },
-                    BridgeEvent::ScreenScaleChanged => {
-                        match (bridge.screen_scale(), bridge.screen_magnification()) {
-                            (Ok(scale), Ok(magnification)) => {
-                                let _ = events.send(SteamWorkerEvent::ScreenScale {
-                                    server_id,
-                                    scale,
-                                    magnification,
-                                });
-                            }
-                            (scale, magnification) => send_worker_error(
-                                &events,
-                                Some(server_id),
-                                format!(
-                                    "failed to read Steam screen scale: {scale:?}, {magnification:?}"
-                                ),
-                            ),
-                        }
-                    }
-                    event => {
-                        let _ = events.send(SteamWorkerEvent::Event { server_id, event });
-                    }
-                }
+            .expect("Steam input-focus mailbox poisoned"),
+    );
+    let mut pending_focus = HashMap::new();
+    for (server_id, target) in focus_updates {
+        if let Some(bridge) = bridges.get(&server_id) {
+            if let Err(error) = bridge.set_input_focus(target) {
+                send_worker_error(events, Some(server_id), error);
             }
+        } else {
+            pending_focus.insert(server_id, target);
         }
+    }
+    shared
+        .input_focus
+        .lock()
+        .expect("Steam input-focus mailbox poisoned")
+        .extend(pending_focus);
+
+    for (&server_id, bridge) in bridges {
+        // A synchronous X11 reply below can consume the socket and buffer
+        // unrelated events inside x11rb. Those events no longer make the fd
+        // readable, so a single poll per calloop wake can strand them forever.
+        // Keep draining until handling a batch produces no more buffered work.
+        let result = drain_event_batches(
+            || bridge.poll_events(),
+            |bridge_events| {
+                for event in bridge_events {
+                    match event {
+                        BridgeEvent::WindowChanged(window) => read_worker_window(
+                            bridge,
+                            server_id,
+                            window,
+                            window_pids.get(&(server_id, window)).copied().flatten(),
+                            events,
+                        ),
+                        BridgeEvent::FocusControlChanged => match bridge.focus_control() {
+                            Ok(control) => {
+                                send_worker_event(
+                                    events,
+                                    SteamWorkerEvent::FocusControl { server_id, control },
+                                );
+                            }
+                            Err(error) => send_worker_error(events, Some(server_id), error),
+                        },
+                        BridgeEvent::ScreenScaleChanged => {
+                            match (bridge.screen_scale(), bridge.screen_magnification()) {
+                                (Ok(scale), Ok(magnification)) => {
+                                    send_worker_event(
+                                        events,
+                                        SteamWorkerEvent::ScreenScale {
+                                            server_id,
+                                            scale,
+                                            magnification,
+                                        },
+                                    );
+                                }
+                                (scale, magnification) => send_worker_error(
+                                    events,
+                                    Some(server_id),
+                                    format!(
+                                        "failed to read Steam screen scale: {scale:?}, {magnification:?}"
+                                    ),
+                                ),
+                            }
+                        }
+                        event => {
+                            send_worker_event(events, SteamWorkerEvent::Event { server_id, event });
+                        }
+                    }
+                }
+            },
+        );
+        if let Err(error) = result {
+            send_worker_error(events, Some(server_id), error);
+            failed_bridges.insert(server_id);
+        }
+    }
+    failed_bridges
+}
+
+fn drain_event_batches<Event, Error>(
+    mut poll: impl FnMut() -> Result<Vec<Event>, Error>,
+    mut process: impl FnMut(Vec<Event>),
+) -> Result<(), Error> {
+    loop {
+        let events = poll()?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        process(events);
+    }
+}
+
+struct SteamWorkerRuntime {
+    shared: Arc<SteamWorkerShared>,
+    bridges: HashMap<u32, SteamX11Bridge>,
+    window_pids: HashMap<(u32, u32), Option<u32>>,
+    events: Sender<SteamWorkerEvent>,
+}
+
+fn synchronize_bridge_sources(
+    handle: &smithay::reexports::calloop::LoopHandle<'_, SteamWorkerRuntime>,
+    tokens: &mut HashMap<u32, RegistrationToken>,
+    runtime: &SteamWorkerRuntime,
+) {
+    let removed = tokens
+        .keys()
+        .copied()
+        .filter(|server_id| !runtime.bridges.contains_key(server_id))
+        .collect::<Vec<_>>();
+    for server_id in removed {
+        if let Some(token) = tokens.remove(&server_id) {
+            handle.remove(token);
+        }
+    }
+    for (&server_id, bridge) in &runtime.bridges {
+        if tokens.contains_key(&server_id) {
+            continue;
+        }
+        let fd = match bridge.event_fd() {
+            Ok(fd) => fd,
+            Err(error) => {
+                send_worker_error(&runtime.events, Some(server_id), error);
+                continue;
+            }
+        };
+        match handle.insert_source(
+            Generic::new(fd, Interest::READ, Mode::Level),
+            |_, _, _runtime| Ok(PostAction::Continue),
+        ) {
+            Ok(token) => {
+                tokens.insert(server_id, token);
+            }
+            Err(error) => send_worker_error(&runtime.events, Some(server_id), error),
+        }
+    }
+}
+
+fn run_steam_worker(
+    shared: Arc<SteamWorkerShared>,
+    commands: Channel<SteamWorkerCommand>,
+    events: Sender<SteamWorkerEvent>,
+) {
+    let mut event_loop = match EventLoop::<SteamWorkerRuntime>::try_new() {
+        Ok(event_loop) => event_loop,
+        Err(error) => {
+            send_worker_error(&events, None, error);
+            return;
+        }
+    };
+    let mut runtime = SteamWorkerRuntime {
+        shared: Arc::clone(&shared),
+        bridges: HashMap::new(),
+        window_pids: HashMap::new(),
+        events,
+    };
+    if let Err(error) =
+        event_loop
+            .handle()
+            .insert_source(commands, |event, (), runtime| match event {
+                ChannelEvent::Msg(command) => process_worker_command(
+                    command,
+                    &mut runtime.bridges,
+                    &mut runtime.window_pids,
+                    &runtime.events,
+                ),
+                ChannelEvent::Closed => runtime.shared.shutdown.store(true, Ordering::Release),
+            })
+    {
+        send_worker_error(&runtime.events, None, error);
+        return;
+    }
+    let handle = event_loop.handle();
+    let mut bridge_tokens = HashMap::new();
+    while !shared.shutdown.load(Ordering::Acquire) {
+        if let Err(error) = event_loop.dispatch(None, &mut runtime) {
+            send_worker_error(&runtime.events, None, error);
+            break;
+        }
+        runtime.shared.wake_pending.store(false, Ordering::Release);
+        let failed = process_worker_state(
+            &runtime.shared,
+            &runtime.bridges,
+            &runtime.window_pids,
+            &runtime.events,
+        );
+        for server_id in failed {
+            runtime.bridges.remove(&server_id);
+            runtime
+                .window_pids
+                .retain(|(candidate, _), _| *candidate != server_id);
+        }
+        synchronize_bridge_sources(&handle, &mut bridge_tokens, &runtime);
     }
 }
 
@@ -1356,10 +1512,32 @@ fn app_id_from_reaper_command_line(command_line: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
+    use std::{cell::RefCell, collections::VecDeque, convert::Infallible};
+
     use super::{
         FocusCandidate, FocusControl, STEAM_APP_ID, VrrFeedbackState, WindowMetadata,
-        app_id_from_reaper_command_line, select_focus, select_managed_ancestor, select_override,
+        app_id_from_reaper_command_line, drain_event_batches, select_focus,
+        select_managed_ancestor, select_override,
     };
+
+    #[test]
+    fn event_drain_repolls_events_buffered_while_processing() {
+        let pending = RefCell::new(VecDeque::from([vec![1_u32]]));
+        let processed = RefCell::new(Vec::new());
+
+        drain_event_batches(
+            || Ok::<_, Infallible>(pending.borrow_mut().pop_front().unwrap_or_default()),
+            |events| {
+                processed.borrow_mut().extend(events);
+                if processed.borrow().as_slice() == [1] {
+                    pending.borrow_mut().push_back(vec![2]);
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*processed.borrow(), [1, 2]);
+    }
 
     #[test]
     fn vrr_feedback_only_changes_capability_and_usage_atoms_when_needed() {

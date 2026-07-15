@@ -367,6 +367,7 @@ impl HardwareBackend {
             }
             Err(error) => {
                 control.shared.shutdown.store(true, Ordering::Release);
+                control.wake.ping();
                 let _ = thread.join();
                 Err(format!("timed out initializing DRM backend: {error}"))
             }
@@ -1114,7 +1115,7 @@ fn run_worker(
 
     let mut was_paused = false;
     while !shared.shutdown.load(Ordering::Acquire) {
-        if let Err(error) = event_loop.dispatch(Some(Duration::from_secs(1)), &mut runtime) {
+        if let Err(error) = event_loop.dispatch(None, &mut runtime) {
             error!(%error, "DRM event loop failed");
             let _ = events.send(HardwareEvent::Error(format!(
                 "DRM event loop failed: {error}"

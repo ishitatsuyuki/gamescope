@@ -4,8 +4,9 @@ use std::{
     fs::File,
     io::{BufWriter, Write as _},
     path::Path,
-    sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
+    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[derive(Debug)]
@@ -61,10 +62,11 @@ impl ScreenshotWriter {
     }
 
     pub fn try_result(&self) -> Option<Result<String, String>> {
-        match self.results.try_recv() {
-            Ok(result) => Some(result),
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => None,
-        }
+        self.results.try_recv().ok()
+    }
+
+    pub fn wait_result(&self, timeout: Duration) -> Option<Result<String, String>> {
+        self.results.recv_timeout(timeout).ok()
     }
 }
 
@@ -148,14 +150,8 @@ mod tests {
                 rgba: vec![1, 2, 3, 4],
             })
             .expect("queue screenshot");
-        let result = (0..100)
-            .find_map(|_| {
-                let result = writer.try_result();
-                if result.is_none() {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                result
-            })
+        let result = writer
+            .wait_result(Duration::from_secs(1))
             .expect("encoder result");
         assert!(result.is_ok());
         assert_eq!(fs::read(&path).expect("raw screenshot"), [1, 2, 3, 4]);
