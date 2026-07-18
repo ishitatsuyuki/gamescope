@@ -2,7 +2,10 @@
 
 use std::time::Duration;
 
-use perfetto_sdk::track_event::{TrackEvent, TrackEventFlow};
+use perfetto_sdk::{
+    producer::{Backends, Producer, ProducerInitArgsBuilder},
+    track_event::{TrackEvent, TrackEventFlow},
+};
 
 perfetto_sdk::track_event_categories! {
     pub mod perfetto_te_ns {
@@ -31,30 +34,10 @@ perfetto_sdk::track_event_categories! {
 
 /// Register Gamescope's track-event categories with the system Perfetto service.
 pub fn init() {
-    init_system_producer();
+    let args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
+    Producer::init(args.build());
     TrackEvent::init();
     let _ = perfetto_te_ns::register();
-}
-
-/// Initialize only the system producer using the stable C ABI present in the
-/// checkout's generated Perfetto library.
-///
-/// The higher-level Rust builder currently also calls the newer machine-id ABI,
-/// while the checked-in C amalgamation predates that optional setter. The
-/// system service derives machine identity itself, so the older initialization
-/// sequence has identical semantics for this process.
-#[allow(unsafe_code)]
-fn init_system_producer() {
-    // SAFETY: `args` is created by Perfetto, used only with Perfetto producer
-    // initialization functions, and destroyed exactly once after the system
-    // initializer has copied its contents. A zero shared-memory hint requests
-    // Perfetto's default sizing policy.
-    unsafe {
-        let args = perfetto_sdk_sys::PerfettoProducerBackendInitArgsCreate();
-        perfetto_sdk_sys::PerfettoProducerBackendInitArgsSetShmemSizeHintKb(args, 0);
-        perfetto_sdk_sys::PerfettoProducerSystemInit(args);
-        perfetto_sdk_sys::PerfettoProducerBackendInitArgsDestroy(args);
-    }
 }
 
 #[must_use]
