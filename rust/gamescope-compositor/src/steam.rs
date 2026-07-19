@@ -21,7 +21,7 @@ use std::{
 };
 
 use gamescope_core::control::ScreenType;
-use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
+use perfetto_sdk::track_event::EventContext;
 use smithay::reexports::calloop::{
     EventLoop, Interest, Mode, PostAction, RegistrationToken,
     channel::{self, Channel, Event as ChannelEvent, Sender},
@@ -41,7 +41,10 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use crate::{perfetto::duration_ns, perfetto_te_ns};
+use crate::{
+    perfetto::{EventField, add_event_fields, duration_ns},
+    perfetto_te_ns,
+};
 
 pub const STEAM_APP_ID: u32 = 769;
 pub const OPAQUE: u32 = u32::MAX;
@@ -302,16 +305,36 @@ pub enum SteamWorkerEvent {
 }
 
 impl SteamWorkerEvent {
-    #[must_use]
-    pub fn kind(&self) -> &'static str {
+    pub(crate) fn trace_delivery_kind(&self) {
         match self {
-            Self::Ready { .. } => "ready",
-            Self::WindowMetadata { .. } => "window_metadata",
-            Self::WindowAncestors { .. } => "window_ancestors",
-            Self::FocusControl { .. } => "focus_control",
-            Self::ScreenScale { .. } => "screen_scale",
-            Self::Event { .. } => "x11_event",
-            Self::Error { .. } => "error",
+            Self::Ready { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Ready event delivery"
+            ),
+            Self::WindowMetadata { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker WindowMetadata event delivery"
+            ),
+            Self::WindowAncestors { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker WindowAncestors event delivery"
+            ),
+            Self::FocusControl { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker FocusControl event delivery"
+            ),
+            Self::ScreenScale { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker ScreenScale event delivery"
+            ),
+            Self::Event { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker X11 event delivery"
+            ),
+            Self::Error { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Error event delivery"
+            ),
         }
     }
 }
@@ -376,15 +399,69 @@ enum SteamWorkerCommand {
 }
 
 impl SteamWorkerCommand {
-    fn kind(&self) -> &'static str {
+    fn trace_queued_kind(&self) {
         match self {
-            Self::Wake => "wake",
-            Self::Register { .. } => "register",
-            Self::Remove { .. } => "remove",
-            Self::WatchWindow { .. } => "watch_window",
-            Self::ReadWindow { .. } => "read_window",
-            Self::ResolveWindow { .. } => "resolve_window",
-            Self::CreateFeedback { .. } => "create_feedback",
+            Self::Wake => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Wake command queued"
+            ),
+            Self::Register { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Register command queued"
+            ),
+            Self::Remove { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Remove command queued"
+            ),
+            Self::WatchWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker WatchWindow command queued"
+            ),
+            Self::ReadWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker ReadWindow command queued"
+            ),
+            Self::ResolveWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker ResolveWindow command queued"
+            ),
+            Self::CreateFeedback { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker CreateFeedback command queued"
+            ),
+        }
+    }
+
+    fn trace_processing_kind(&self) {
+        match self {
+            Self::Wake => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Wake command processing"
+            ),
+            Self::Register { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Register command processing"
+            ),
+            Self::Remove { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker Remove command processing"
+            ),
+            Self::WatchWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker WatchWindow command processing"
+            ),
+            Self::ReadWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker ReadWindow command processing"
+            ),
+            Self::ResolveWindow { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker ResolveWindow command processing"
+            ),
+            Self::CreateFeedback { .. } => perfetto_sdk::track_event_instant!(
+                "gamescope.xwm",
+                "Steam worker CreateFeedback command processing"
+            ),
         }
     }
 }
@@ -478,12 +555,16 @@ impl SteamBridgeWorker {
             "gamescope.input",
             "X11 input focus requested",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg(
-                    "server_id",
-                    TrackEventDebugArg::Uint64(u64::from(server_id)),
-                );
                 if let Some(window) = window {
-                    ctx.add_debug_arg("window", TrackEventDebugArg::Uint64(u64::from(window)));
+                    add_event_fields(
+                        ctx,
+                        &[
+                            EventField::ServerId(u64::from(server_id)),
+                            EventField::Window(u64::from(window)),
+                        ],
+                    );
+                } else {
+                    add_event_fields(ctx, &[EventField::ServerId(u64::from(server_id))]);
                 }
             }
         );
@@ -562,13 +643,7 @@ impl SteamBridgeWorker {
 
     fn send_command(&self, command: SteamWorkerCommand) {
         let queued_at = Instant::now();
-        perfetto_sdk::track_event_instant!(
-            "gamescope.xwm",
-            "Steam worker command queued",
-            |ctx: &mut EventContext| {
-                ctx.add_debug_arg("kind", TrackEventDebugArg::String(command.kind()));
-            }
-        );
+        command.trace_queued_kind();
         let _ = self.commands.send((queued_at, command));
     }
 
@@ -1015,11 +1090,12 @@ impl SteamX11Bridge {
 
     pub fn set_input_focus(&self, window: Option<u32>) -> Result<(), Box<dyn Error>> {
         use x11rb::protocol::xproto::InputFocus;
-        self.connection.set_input_focus(
+        let cookie = self.connection.set_input_focus(
             InputFocus::NONE,
             window.unwrap_or(x11rb::NONE),
             x11rb::CURRENT_TIME,
         )?;
+        cookie.check()?;
         self.connection.flush()?;
         Ok(())
     }
@@ -1335,12 +1411,16 @@ fn process_worker_state(
                 "gamescope.input",
                 "X11 input focus applied",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "server_id",
-                        TrackEventDebugArg::Uint64(u64::from(server_id)),
-                    );
                     if let Some(window) = target {
-                        ctx.add_debug_arg("window", TrackEventDebugArg::Uint64(u64::from(window)));
+                        add_event_fields(
+                            ctx,
+                            &[
+                                EventField::ServerId(u64::from(server_id)),
+                                EventField::Window(u64::from(window)),
+                            ],
+                        );
+                    } else {
+                        add_event_fields(ctx, &[EventField::ServerId(u64::from(server_id))]);
                     }
                 }
             );
@@ -1369,13 +1449,12 @@ fn process_worker_state(
                     "gamescope.xwm",
                     "Steam X11 event batch",
                     |ctx: &mut EventContext| {
-                        ctx.add_debug_arg(
-                            "server_id",
-                            TrackEventDebugArg::Uint64(u64::from(server_id)),
-                        );
-                        ctx.add_debug_arg(
-                            "event_count",
-                            TrackEventDebugArg::Uint64(bridge_events.len() as u64),
+                        add_event_fields(
+                            ctx,
+                            &[
+                                EventField::ServerId(u64::from(server_id)),
+                                EventField::EventCount(bridge_events.len() as u64),
+                            ],
                         );
                     }
                 );
@@ -1514,14 +1593,14 @@ fn run_steam_worker(
             .handle()
             .insert_source(commands, |event, (), runtime| match event {
                 ChannelEvent::Msg((queued_at, command)) => {
+                    command.trace_processing_kind();
                     perfetto_sdk::scoped_track_event!(
                         "gamescope.xwm",
                         "Steam worker command",
                         |ctx: &mut EventContext| {
-                            ctx.add_debug_arg("kind", TrackEventDebugArg::String(command.kind()));
-                            ctx.add_debug_arg(
-                                "queue_delay_ns",
-                                TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                            add_event_fields(
+                                ctx,
+                                &[EventField::QueueDelayNs(duration_ns(queued_at.elapsed()))],
                             );
                         }
                     );
@@ -1548,9 +1627,11 @@ fn run_steam_worker(
                 "Steam worker calloop dispatch",
                 |_| {},
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "elapsed_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::ElapsedNs(duration_ns(
+                            dispatch_started.elapsed(),
+                        ))],
                     );
                 }
             );
@@ -1570,14 +1651,18 @@ fn run_steam_worker(
             "gamescope.xwm",
             "Steam worker state batch",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg(
-                    "bridge_count",
-                    TrackEventDebugArg::Uint64(runtime.bridges.len() as u64),
-                );
                 if let Some(queued_at) = wake_requested_at {
-                    ctx.add_debug_arg(
-                        "mailbox_wake_delay_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[
+                            EventField::BridgeCount(runtime.bridges.len() as u64),
+                            EventField::MailboxWakeDelayNs(duration_ns(queued_at.elapsed())),
+                        ],
+                    );
+                } else {
+                    add_event_fields(
+                        ctx,
+                        &[EventField::BridgeCount(runtime.bridges.len() as u64)],
                     );
                 }
             }

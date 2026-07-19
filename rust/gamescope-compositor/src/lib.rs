@@ -28,7 +28,7 @@ use gamescope_wayland_server::{
     ActiveDisplayInfo, Command, GamescopeHandler, GamescopeState, InputMethodCommand, ServerConfig,
     delegate_gamescope,
 };
-use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
+use perfetto_sdk::track_event::EventContext;
 use smithay::{
     backend::{
         allocator::{Format, dmabuf::Dmabuf},
@@ -321,6 +321,84 @@ impl KeyboardFocusTarget {
             Self::X11(window) => window.wl_surface(),
         }
     }
+
+    fn trace_enter(&self) {
+        match self {
+            Self::Wayland(surface) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "Wayland keyboard focus enter",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[perfetto::EventField::SurfaceAlive(surface.is_alive())],
+                )
+            ),
+            Self::X11(window) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "X11 keyboard focus enter",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[
+                        perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
+                    ],
+                )
+            ),
+        }
+    }
+
+    fn trace_leave(&self) {
+        match self {
+            Self::Wayland(surface) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "Wayland keyboard focus leave",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[perfetto::EventField::SurfaceAlive(surface.is_alive())],
+                )
+            ),
+            Self::X11(window) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "X11 keyboard focus leave",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[
+                        perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
+                    ],
+                )
+            ),
+        }
+    }
+
+    fn trace_key(&self, keysym: u64, pressed: bool) {
+        match self {
+            Self::Wayland(surface) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "Wayland keyboard target key",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[
+                        perfetto::EventField::SurfaceAlive(surface.is_alive()),
+                        perfetto::EventField::Keysym(keysym),
+                        perfetto::EventField::Pressed(pressed),
+                    ],
+                )
+            ),
+            Self::X11(window) => perfetto_sdk::track_event_instant!(
+                "gamescope.input",
+                "X11 keyboard target key",
+                |ctx: &mut EventContext| perfetto::add_event_fields(
+                    ctx,
+                    &[
+                        perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
+                        perfetto::EventField::Keysym(keysym),
+                        perfetto::EventField::Pressed(pressed),
+                    ],
+                )
+            ),
+        }
+    }
 }
 
 impl WaylandFocus for KeyboardFocusTarget {
@@ -349,6 +427,7 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
         keys: Vec<KeysymHandle<'_>>,
         serial: Serial,
     ) {
+        self.trace_enter();
         match self {
             Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, state, keys, serial),
             Self::X11(window) => KeyboardTarget::enter(window, seat, state, keys, serial),
@@ -356,6 +435,7 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
     }
 
     fn leave(&self, seat: &Seat<State>, state: &mut State, serial: Serial) {
+        self.trace_leave();
         match self {
             Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, state, serial),
             Self::X11(window) => KeyboardTarget::leave(window, seat, state, serial),
@@ -371,6 +451,10 @@ impl KeyboardTarget<State> for KeyboardFocusTarget {
         serial: Serial,
         time: u32,
     ) {
+        self.trace_key(
+            u64::from(key.modified_sym().raw()),
+            key_state == KeyState::Pressed,
+        );
         match self {
             Self::Wayland(surface) => {
                 KeyboardTarget::key(surface, seat, state, key, key_state, serial, time);
@@ -834,14 +918,16 @@ impl State {
         let mut requests = Vec::new();
         let mut focus_dirty = false;
         for (queued_at, event) in std::mem::take(&mut self.pending_steam_events) {
+            event.trace_delivery_kind();
             perfetto_sdk::scoped_track_event!(
                 "gamescope.xwm",
                 "Steam worker event delivery",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg("kind", TrackEventDebugArg::String(event.kind()));
-                    ctx.add_debug_arg(
-                        "worker_to_frontend_ns",
-                        TrackEventDebugArg::Uint64(perfetto::duration_ns(queued_at.elapsed())),
+                    perfetto::add_event_fields(
+                        ctx,
+                        &[perfetto::EventField::WorkerToFrontendNs(
+                            perfetto::duration_ns(queued_at.elapsed()),
+                        )],
                     );
                 }
             );
@@ -1382,7 +1468,6 @@ impl State {
 
     /// Re-evaluate Steam's base/overlay policy and apply X11 and Wayland focus.
     pub fn refresh_focus(&mut self, serial: Serial) {
-        self.apply_x11_focus();
         let next = self
             .keyboard_x11_window()
             .map(KeyboardFocusTarget::X11)
@@ -1391,6 +1476,13 @@ impl State {
                     .map(KeyboardFocusTarget::Wayland)
             });
         self.set_keyboard_focus(next, serial);
+
+        // Smithay clears Xwayland's core focus while leaving the previous X11
+        // target. Globally-active clients only receive WM_TAKE_FOCUS on enter,
+        // so they do not set core focus again themselves. Queue Gamescope's
+        // explicit XSetInputFocus after the leave/enter transition to ensure
+        // the worker's request is the final focus operation.
+        self.apply_x11_focus();
         self.publish_steam_focus();
     }
 
@@ -1421,20 +1513,20 @@ impl State {
             }
         }
 
-        // Upstream Gamescope always applies XSetInputFocus, including for the
-        // globally-active ICCCM model used by Wine/Unity. Reassert it on every
-        // focus refresh because late WM_HINTS or xwayland-shell association
-        // can temporarily clear Xwayland's core focus without changing our
-        // selected window.
+        if next_key == self.last_x11_focus {
+            return;
+        }
+
+        // Upstream Gamescope explicitly applies XSetInputFocus, including for
+        // the globally-active ICCCM model used by Wine/Unity. Do so only when
+        // the target changes: refresh_focus also runs for pointer motion, and
+        // repeatedly focusing the same window produces an X FocusOut/FocusIn
+        // storm. Intentional ICCCM re-entry invalidates last_x11_focus below.
         for (xwm_id, server_id) in &self.xwayland_server_ids {
             let target = next_key
                 .filter(|(target_xwm, _)| target_xwm == xwm_id)
                 .map(|(_, window)| window);
             self.steam_worker.set_input_focus(*server_id, target);
-        }
-
-        if next_key == self.last_x11_focus {
-            return;
         }
 
         for window in &self.x11_windows {
@@ -1511,11 +1603,47 @@ impl State {
         }
     }
 
+    /// Focus a native Wayland surface only when Steam's X11 policy has no
+    /// target. If the surface already belongs to a tracked X11 window, retain
+    /// the wrapper that implements the client's ICCCM input model.
+    fn focus_wayland_surface(&mut self, surface: WlSurface, serial: Serial) {
+        if let Some(window) = self
+            .x11_windows
+            .iter()
+            .find(|window| window.wl_surface().as_ref() == Some(&surface))
+            .cloned()
+        {
+            self.set_keyboard_focus(Some(KeyboardFocusTarget::X11(window)), serial);
+        } else if self.keyboard_x11_window().is_none() {
+            self.set_keyboard_focus(Some(KeyboardFocusTarget::Wayland(surface)), serial);
+        }
+    }
+
+    /// Repair a focus target that was replaced by a late Wayland shell event.
+    /// Called at the physical-input boundary so the triggering key itself is
+    /// delivered to the policy-selected X11 window.
+    pub fn repair_keyboard_focus(&mut self, serial: Serial) -> bool {
+        let Some(window) = self.keyboard_x11_window() else {
+            return false;
+        };
+        let next = KeyboardFocusTarget::X11(window);
+        if self.keyboard_focus.as_ref() == Some(&next) {
+            return false;
+        }
+        self.set_keyboard_focus(Some(next), serial);
+        self.apply_x11_focus();
+        true
+    }
+
     fn clear_early_x11_focus(&mut self, window: &X11Surface) {
         if self.keyboard_focus.as_ref().is_some_and(
             |focus| matches!(focus, KeyboardFocusTarget::X11(focused) if focused == window),
         ) {
             self.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
+            // The selected X11 window itself may be unchanged, but Smithay's
+            // leave cleared Xwayland's core focus. Force apply_x11_focus to
+            // restore it after the matching enter transition.
+            self.last_x11_focus = None;
         }
     }
 
@@ -1914,10 +2042,25 @@ impl State {
             KeyState::Released => self.pressed_keysyms.retain(|pressed| *pressed != keysym),
             KeyState::Pressed => {}
         }
-        if self
+        let intercepted = self
             .gamescope_state
-            .process_pressed_keysyms(self.pressed_keysyms.iter().copied(), monotonic_time_ns)
-        {
+            .process_pressed_keysyms(self.pressed_keysyms.iter().copied(), monotonic_time_ns);
+        perfetto_sdk::track_event_instant!(
+            "gamescope.input",
+            "Keyboard filter decision",
+            |ctx: &mut EventContext| {
+                perfetto::add_event_fields(
+                    ctx,
+                    &[
+                        perfetto::EventField::Keysym(u64::from(keysym)),
+                        perfetto::EventField::Pressed(state == KeyState::Pressed),
+                        perfetto::EventField::Intercepted(intercepted),
+                        perfetto::EventField::PressedKeys(self.pressed_keysyms.len() as u64),
+                    ],
+                );
+            }
+        );
+        if intercepted {
             FilterResult::Intercept(())
         } else {
             FilterResult::Forward
@@ -2253,10 +2396,7 @@ impl CompositorHandler for State {
                 .push((surface.clone(), metadata));
         }
         if self.focused_surface.is_none() {
-            self.set_keyboard_focus(
-                Some(KeyboardFocusTarget::Wayland(surface.clone())),
-                SERIAL_COUNTER.next_serial(),
-            );
+            self.focus_wayland_surface(surface.clone(), SERIAL_COUNTER.next_serial());
         }
     }
 }
@@ -2276,10 +2416,7 @@ impl XdgShellHandler for State {
                 .map(|mode| (mode.size.w, mode.size.h).into());
         });
         let _ = surface.send_configure();
-        self.set_keyboard_focus(
-            Some(KeyboardFocusTarget::Wayland(surface.wl_surface().clone())),
-            SERIAL_COUNTER.next_serial(),
-        );
+        self.focus_wayland_surface(surface.wl_surface().clone(), SERIAL_COUNTER.next_serial());
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -2320,10 +2457,7 @@ impl WlrLayerShellHandler for State {
             });
         }
         surface.send_configure();
-        self.set_keyboard_focus(
-            Some(KeyboardFocusTarget::Wayland(surface.wl_surface().clone())),
-            SERIAL_COUNTER.next_serial(),
-        );
+        self.focus_wayland_surface(surface.wl_surface().clone(), SERIAL_COUNTER.next_serial());
     }
 }
 
@@ -2378,6 +2512,13 @@ impl XwmHandler for State {
             self.x11_windows.push(window.clone());
         }
         self.track_x11_window(&window);
+    }
+
+    fn map_window_notify(&mut self, _xwm: XwmId, window: X11Surface) {
+        // The reparenting frame is viewable only once MapNotify arrives.
+        // Focusing from map_window_request races that transition and can fail
+        // with BadMatch, leaving globally-active Wine clients unfocused.
+        self.clear_early_x11_focus(&window);
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 
@@ -2545,6 +2686,32 @@ impl SeatHandler for State {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
+        match focused {
+            Some(KeyboardFocusTarget::Wayland(surface)) => {
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.input",
+                    "Wayland keyboard focus changed",
+                    |ctx: &mut EventContext| perfetto::add_event_fields(
+                        ctx,
+                        &[perfetto::EventField::SurfaceAlive(surface.is_alive())],
+                    )
+                );
+            }
+            Some(KeyboardFocusTarget::X11(window)) => {
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.input",
+                    "X11 keyboard focus changed",
+                    |ctx: &mut EventContext| perfetto::add_event_fields(
+                        ctx,
+                        &[
+                            perfetto::EventField::Window(u64::from(window.window_id())),
+                            perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
+                        ],
+                    )
+                );
+            }
+            None => perfetto_sdk::track_event_instant!("gamescope.input", "Keyboard focus cleared"),
+        }
         self.keyboard_focus = focused.cloned();
         self.focused_surface = focused.and_then(KeyboardFocusTarget::owned_wl_surface);
     }

@@ -74,6 +74,10 @@ Run validation with:
 cargo test --workspace --all-features
 ```
 
+For live DRM, Steam, Xwayland, input, direct-scanout, overlay, and frame-pacing
+diagnostics, see
+[`docs/rust-compositor-debugging.md`](../docs/rust-compositor-debugging.md).
+
 The integration tests use real Wayland socket pairs. They cover registry
 negotiation, core surface commits, Vulkan swapchain timing, private input-method
 transactions, Steam focus/role policy, Steam launch options, backend command

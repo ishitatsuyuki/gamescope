@@ -21,7 +21,7 @@ use std::{
 };
 
 use gamescope_core::control::{DisplayPowerOperation, RefreshCycleOverride, ScreenType};
-use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
+use perfetto_sdk::track_event::EventContext;
 use smithay::{
     backend::{
         allocator::{
@@ -62,7 +62,7 @@ use tracing::{error, info, warn};
 
 use crate::{
     CursorLayer, LayerRenderElement, OutputConfig, RenderLayer, State,
-    perfetto::{duration_ns, frame_flow},
+    perfetto::{EventField, add_event_fields, duration_ns, frame_flow},
     perfetto_te_ns,
 };
 
@@ -272,8 +272,13 @@ impl HardwareControl {
                 "gamescope.frame",
                 "DRM frame coalesced",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg("replaced_frame_id", TrackEventDebugArg::Uint64(replaced));
-                    ctx.add_debug_arg("new_frame_id", TrackEventDebugArg::Uint64(frame_id));
+                    add_event_fields(
+                        ctx,
+                        &[
+                            EventField::ReplacedFrameId(replaced),
+                            EventField::NewFrameId(frame_id),
+                        ],
+                    );
                     ctx.set_terminating_flow(&frame_flow(replaced, 0));
                 }
             );
@@ -282,7 +287,7 @@ impl HardwareControl {
             "gamescope.frame",
             "DRM frame mailbox submit",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
+                add_event_fields(ctx, &[EventField::FrameId(frame_id)]);
                 ctx.set_flow(&frame_flow(frame_id, 0));
             }
         );
@@ -733,14 +738,13 @@ impl DrmRuntime {
             "gamescope.frame",
             "DRM prepare and commit frame",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame.id));
-                ctx.add_debug_arg(
-                    "layer_count",
-                    TrackEventDebugArg::Uint64(frame.layers.len() as u64),
-                );
-                ctx.add_debug_arg(
-                    "has_cursor",
-                    TrackEventDebugArg::Bool(frame.cursor.is_some()),
+                add_event_fields(
+                    ctx,
+                    &[
+                        EventField::FrameId(frame.id),
+                        EventField::LayerCount(frame.layers.len() as u64),
+                        EventField::HasCursor(frame.cursor.is_some()),
+                    ],
                 );
                 ctx.set_terminating_flow(&frame_flow(frame.id, 0));
             }
@@ -893,10 +897,12 @@ impl DrmRuntime {
                     "gamescope.frame",
                     "DRM atomic commit queued",
                     |ctx: &mut EventContext| {
-                        ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame.id));
-                        ctx.add_debug_arg(
-                            "direct_scanout",
-                            TrackEventDebugArg::Bool(direct_scanout),
+                        add_event_fields(
+                            ctx,
+                            &[
+                                EventField::FrameId(frame.id),
+                                EventField::DirectScanout(direct_scanout),
+                            ],
                         );
                         ctx.set_flow(&frame_flow(frame.id, 1));
                     }
@@ -931,12 +937,14 @@ impl DrmRuntime {
                     "gamescope.frame",
                     "DRM page flip",
                     |ctx: &mut EventContext| {
-                        ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(token.id));
-                        ctx.add_debug_arg(
-                            "sequence",
-                            TrackEventDebugArg::Uint64(u64::from(
-                                metadata.map_or(0, |metadata| metadata.sequence),
-                            )),
+                        add_event_fields(
+                            ctx,
+                            &[
+                                EventField::FrameId(token.id),
+                                EventField::Sequence(u64::from(
+                                    metadata.map_or(0, |metadata| metadata.sequence),
+                                )),
+                            ],
                         );
                         ctx.set_terminating_flow(&frame_flow(token.id, 1));
                         ctx.set_flow(&frame_flow(token.id, 2));
@@ -1194,9 +1202,11 @@ fn run_worker(
                 "DRM worker calloop dispatch",
                 |_| {},
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "elapsed_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::ElapsedNs(duration_ns(
+                            dispatch_started.elapsed(),
+                        ))],
                     );
                 }
             );

@@ -17,21 +17,21 @@ use gamescope_compositor::{
         DirectScanoutStatus, HardwareBackend, HardwareConfig, HardwareEvent, HardwareFrame,
         HardwareOutputInfo,
     },
-    perfetto::{duration_ns, frame_flow},
+    perfetto::{EventField, add_event_fields, duration_ns, frame_flow},
     perfetto_te_ns,
     steam::{COMMON_COMPAT_ENV, STEAM_COMPAT_ENV},
 };
 use gamescope_core::control::{RefreshCycleOverride, ScreenType};
 use gamescope_wayland_server::{ActiveDisplayInfo, Command as GamescopeCommand, ServerConfig};
-use perfetto_sdk::track_event::{EventContext, TrackEventDebugArg};
+use perfetto_sdk::track_event::EventContext;
 use smithay::{
     backend::{
         drm::DrmNode,
         egl::EGLDevice,
         input::{
             AbsolutePositionEvent, Axis, Event, GestureBeginEvent, GestureEndEvent,
-            GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputEvent, KeyboardKeyEvent,
-            PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
+            GesturePinchUpdateEvent, GestureSwipeUpdateEvent, InputEvent, KeyState,
+            KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent, TouchEvent,
         },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
@@ -591,9 +591,11 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 "gamescope.event_loop",
                 "Nested Winit wake",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "queued_events",
-                        TrackEventDebugArg::Uint64(pending_winit_events.borrow().len() as u64),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::QueuedEvents(
+                            pending_winit_events.borrow().len() as u64,
+                        )],
                     );
                 }
             );
@@ -619,11 +621,11 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 "gamescope.frame",
                 "Nested refresh timer",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "timer_late_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(
+                    add_event_fields(
+                        ctx,
+                        &[EventField::TimerLateNs(duration_ns(
                             fired_at.saturating_duration_since(deadline),
-                        )),
+                        ))],
                     );
                 }
             );
@@ -645,9 +647,11 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 "Nested calloop dispatch",
                 |_| {},
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "elapsed_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::ElapsedNs(duration_ns(
+                            dispatch_started.elapsed(),
+                        ))],
                     );
                 }
             );
@@ -657,9 +661,11 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             "gamescope.event_loop",
             "Nested compositor wake batch",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg(
-                    "winit_queue_depth",
-                    TrackEventDebugArg::Uint64(winit_events.borrow().len() as u64),
+                add_event_fields(
+                    ctx,
+                    &[EventField::WinitQueueDepth(
+                        winit_events.borrow().len() as u64
+                    )],
                 );
             }
         );
@@ -700,9 +706,9 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 "gamescope.event_loop",
                 "Nested Winit event processing",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "queue_delay_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::QueueDelayNs(duration_ns(queued_at.elapsed()))],
                     );
                 }
             );
@@ -712,6 +718,9 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             match event {
                 WinitEvent::Input(InputEvent::Keyboard { event }) => {
                     state.bump_input_counter();
+                    if state.repair_keyboard_focus(Serial::from(serial)) {
+                        serial = serial.wrapping_add(1);
+                    }
                     if let Some(keyboard) = state.seat.get_keyboard() {
                         let timestamp = u32::try_from(state.started_at.elapsed().as_millis())
                             .unwrap_or(u32::MAX);
@@ -732,8 +741,6 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 }
                 WinitEvent::Input(InputEvent::PointerMotionAbsolute { event }) => {
                     state.bump_input_counter();
-                    state.refresh_focus(Serial::from(serial));
-                    serial = serial.wrapping_add(1);
                     if let Some(mode) = state.output.current_mode() {
                         let location = state.transform_pointer_for_global_scale((
                             event.x_transformed(mode.size.w),
@@ -845,9 +852,11 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             "gamescope.frame",
             "Nested render and submit",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg(
-                    "ready_to_render_ns",
-                    TrackEventDebugArg::Uint64(duration_ns(frame_ready_at.elapsed())),
+                add_event_fields(
+                    ctx,
+                    &[EventField::ReadyToRenderNs(duration_ns(
+                        frame_ready_at.elapsed(),
+                    ))],
                 );
             }
         );
@@ -1164,16 +1173,18 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 "DRM frontend calloop dispatch",
                 |ctx: &mut EventContext| {
                     if let Some(timeout) = timeout {
-                        ctx.add_debug_arg(
-                            "requested_timeout_ns",
-                            TrackEventDebugArg::Uint64(duration_ns(timeout)),
+                        add_event_fields(
+                            ctx,
+                            &[EventField::RequestedTimeoutNs(duration_ns(timeout))],
                         );
                     }
                 },
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "elapsed_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(dispatch_started.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::ElapsedNs(duration_ns(
+                            dispatch_started.elapsed(),
+                        ))],
                     );
                 }
             );
@@ -1183,9 +1194,11 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
             "gamescope.event_loop",
             "DRM frontend wake batch",
             |ctx: &mut EventContext| {
-                ctx.add_debug_arg(
-                    "hardware_event_queue_depth",
-                    TrackEventDebugArg::Uint64(hardware_events.borrow().len() as u64),
+                add_event_fields(
+                    ctx,
+                    &[EventField::HardwareEventQueueDepth(
+                        hardware_events.borrow().len() as u64,
+                    )],
                 );
             }
         );
@@ -1301,9 +1314,11 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 "gamescope.event_loop",
                 "DRM worker event processing",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg(
-                        "callback_queue_delay_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(queued_at.elapsed())),
+                    add_event_fields(
+                        ctx,
+                        &[EventField::CallbackQueueDelayNs(duration_ns(
+                            queued_at.elapsed(),
+                        ))],
                     );
                 }
             );
@@ -1319,10 +1334,12 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                         "gamescope.frame",
                         "DRM presentation delivered",
                         |ctx: &mut EventContext| {
-                            ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
-                            ctx.add_debug_arg(
-                                "worker_to_frontend_ns",
-                                TrackEventDebugArg::Uint64(duration_ns(at.elapsed())),
+                            add_event_fields(
+                                ctx,
+                                &[
+                                    EventField::FrameId(frame_id),
+                                    EventField::WorkerToFrontendNs(duration_ns(at.elapsed())),
+                                ],
                             );
                             ctx.set_terminating_flow(&frame_flow(frame_id, 2));
                         }
@@ -1425,12 +1442,14 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 "gamescope.frame",
                 "DRM latch and publish frame",
                 |ctx: &mut EventContext| {
-                    ctx.add_debug_arg("frame_id", TrackEventDebugArg::Uint64(frame_id));
-                    ctx.add_debug_arg(
-                        "repaint_late_ns",
-                        TrackEventDebugArg::Uint64(duration_ns(
-                            now.saturating_duration_since(repaint_at),
-                        )),
+                    add_event_fields(
+                        ctx,
+                        &[
+                            EventField::FrameId(frame_id),
+                            EventField::RepaintLateNs(duration_ns(
+                                now.saturating_duration_since(repaint_at),
+                            )),
+                        ],
                     );
                 }
             );
@@ -1508,10 +1527,25 @@ fn process_libinput_event(event: InputEvent<LibinputInputBackend>, state: &mut S
     match event {
         InputEvent::Keyboard { event } => {
             state.bump_input_counter();
+            state.repair_keyboard_focus(SERIAL_COUNTER.next_serial());
             let key_state = event.state();
             let keycode = event.key_code();
             let vt_intercepted = state.filter_vt_keycode(keycode, key_state);
             if let Some(keyboard) = state.seat.get_keyboard() {
+                perfetto_sdk::track_event_instant!(
+                    "gamescope.input",
+                    "Libinput keyboard event",
+                    |ctx: &mut EventContext| {
+                        add_event_fields(
+                            ctx,
+                            &[
+                                EventField::Keycode(u64::from(u32::from(keycode))),
+                                EventField::Pressed(key_state == KeyState::Pressed),
+                                EventField::EventTimeUs(event.time()),
+                            ],
+                        );
+                    }
+                );
                 keyboard.input::<(), _>(
                     state,
                     keycode,
@@ -1530,7 +1564,6 @@ fn process_libinput_event(event: InputEvent<LibinputInputBackend>, state: &mut S
         }
         InputEvent::PointerMotion { event } => {
             state.bump_input_counter();
-            state.refresh_focus(SERIAL_COUNTER.next_serial());
             state.pointer_motion_relative(
                 event.delta(),
                 event.delta_unaccel(),
@@ -1541,7 +1574,6 @@ fn process_libinput_event(event: InputEvent<LibinputInputBackend>, state: &mut S
         }
         InputEvent::PointerMotionAbsolute { event } => {
             state.bump_input_counter();
-            state.refresh_focus(SERIAL_COUNTER.next_serial());
             if let Some(mode) = state.output.current_mode() {
                 let location = state.transform_pointer_for_global_scale((
                     event.x_transformed(mode.size.w),

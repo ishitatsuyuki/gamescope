@@ -1,0 +1,15 @@
+// Copyright 2026 Gamescope contributors
+// SPDX-License-Identifier: BSD-2-Clause
+
+syntax = "proto2";
+
+import "protos/perfetto/trace/track_event/track_event.proto";
+import "gamescope_event.proto";
+
+package gamescope.protos;
+
+message GamescopeExtension {
+  extend perfetto.protos.TrackEvent {
+    optional GamescopeEvent gamescope_event = 3200;
+  }
+}

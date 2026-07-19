@@ -1,0 +1,42 @@
+// Copyright 2026 Gamescope contributors
+// SPDX-License-Identifier: BSD-2-Clause
+
+syntax = "proto2";
+
+package gamescope.protos;
+
+// Structured fields attached to Gamescope TrackEvents. Event names describe
+// the operation and variant; this message contains only queryable values.
+message GamescopeEvent {
+  optional uint64 frame_id = 1;
+  optional uint64 replaced_frame_id = 2;
+  optional uint64 new_frame_id = 3;
+  optional uint64 layer_count = 4;
+  optional bool has_cursor = 5;
+  optional bool direct_scanout = 6;
+  optional uint64 sequence = 7;
+  optional uint64 elapsed_ns = 8;
+  optional uint64 queued_events = 9;
+  optional uint64 timer_late_ns = 10;
+  optional uint64 winit_queue_depth = 11;
+  optional uint64 queue_delay_ns = 12;
+  optional uint64 ready_to_render_ns = 13;
+  optional uint64 requested_timeout_ns = 14;
+  optional uint64 hardware_event_queue_depth = 15;
+  optional uint64 callback_queue_delay_ns = 16;
+  optional uint64 worker_to_frontend_ns = 17;
+  optional uint64 repaint_late_ns = 18;
+  optional uint64 keycode = 19;
+  optional bool pressed = 20;
+  optional uint64 event_time_us = 21;
+  optional bool surface_alive = 22;
+  optional uint64 window = 23;
+  optional bool surface_associated = 24;
+  optional uint64 keysym = 25;
+  optional bool intercepted = 26;
+  optional uint64 pressed_keys = 27;
+  optional uint64 server_id = 28;
+  optional uint64 event_count = 29;
+  optional uint64 bridge_count = 30;
+  optional uint64 mailbox_wake_delay_ns = 31;
+}

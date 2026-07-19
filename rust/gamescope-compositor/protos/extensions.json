@@ -1,0 +1,21 @@
+{
+  "extensions": [
+    {
+      "scope": "perfetto.protos.TrackEvent",
+      "range": [3200, 3299],
+      "allocations": [
+        {
+          "name": "gamescope",
+          "range": [3200, 3200],
+          "contact": "https://github.com/ValveSoftware/gamescope/issues",
+          "description": "Gamescope compositor instrumentation",
+          "proto": "rust/gamescope-compositor/protos/gamescope_extension.proto"
+        },
+        {
+          "name": "unallocated",
+          "range": [3201, 3299]
+        }
+      ]
+    }
+  ]
+}
