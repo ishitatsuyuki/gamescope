@@ -339,6 +339,7 @@ impl KeyboardFocusTarget {
                     ctx,
                     &[
                         perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAlive(window.alive()),
                         perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
                     ],
                 )
@@ -363,6 +364,7 @@ impl KeyboardFocusTarget {
                     ctx,
                     &[
                         perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAlive(window.alive()),
                         perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
                     ],
                 )
@@ -391,6 +393,7 @@ impl KeyboardFocusTarget {
                     ctx,
                     &[
                         perfetto::EventField::Window(u64::from(window.window_id())),
+                        perfetto::EventField::SurfaceAlive(window.alive()),
                         perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
                         perfetto::EventField::Keysym(keysym),
                         perfetto::EventField::Pressed(pressed),
@@ -488,6 +491,15 @@ const fn x11_property_changes_input_mode(property: WmWindowProperty) -> bool {
         property,
         WmWindowProperty::Hints | WmWindowProperty::Protocols
     )
+}
+
+fn x11_window_identity_matches<T: PartialEq>(
+    candidate_xwm_id: Option<T>,
+    candidate_window_id: u32,
+    xwm_id: T,
+    window_id: u32,
+) -> bool {
+    candidate_xwm_id == Some(xwm_id) && candidate_window_id == window_id
 }
 
 /// Complete protocol state for the compositor frontend.
@@ -845,10 +857,11 @@ impl State {
         else {
             return false;
         };
-        let focused_belongs_to_server = self.focused_surface.as_ref().is_some_and(|focused| {
-            self.x11_windows.iter().any(|window| {
-                window.xwm_id() == Some(xwm_id) && window.wl_surface().as_ref() == Some(focused)
-            })
+        let focused_belongs_to_server = self.keyboard_focus.as_ref().is_some_and(|focus| {
+            matches!(
+                focus,
+                KeyboardFocusTarget::X11(window) if window.xwm_id() == Some(xwm_id)
+            )
         });
         if focused_belongs_to_server {
             self.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
@@ -1168,6 +1181,37 @@ impl State {
         self.refresh_x11_metadata(xwm_id, window.window_id());
     }
 
+    fn remember_x11_window(&mut self, window: &X11Surface) {
+        let Some(xwm_id) = window.xwm_id() else {
+            return;
+        };
+        let window_id = window.window_id();
+
+        // X11 resource IDs may be reused after DestroyNotify. Smithay marks a
+        // destroyed X11Surface dead before calling destroyed_window, and its
+        // PartialEq deliberately reports dead surfaces as unequal even to
+        // themselves. Compare the stable identity here so an old wrapper can
+        // never shadow a newly-created window with the same XID.
+        self.x11_windows.retain(|candidate| {
+            !x11_window_identity_matches(
+                candidate.xwm_id(),
+                candidate.window_id(),
+                xwm_id,
+                window_id,
+            ) || candidate.alive()
+        });
+        if !self.x11_windows.iter().any(|candidate| {
+            x11_window_identity_matches(
+                candidate.xwm_id(),
+                candidate.window_id(),
+                xwm_id,
+                window_id,
+            )
+        }) {
+            self.x11_windows.push(window.clone());
+        }
+    }
+
     fn refresh_x11_metadata(&mut self, xwm_id: XwmId, window_id: u32) {
         let pid = self
             .x11_windows
@@ -1196,6 +1240,9 @@ impl State {
     }
 
     fn focus_candidate(&self, window: &X11Surface) -> Option<FocusCandidate> {
+        if !window.alive() {
+            return None;
+        }
         let xwm_id = window.xwm_id()?;
         let metadata = self.metadata_for(window);
         if !metadata.is_focus_candidate() {
@@ -1229,7 +1276,8 @@ impl State {
         self.x11_windows
             .iter()
             .find(|window| {
-                self.server_id_for(window) == selected.server_id
+                window.alive()
+                    && self.server_id_for(window) == selected.server_id
                     && window.window_id() == selected.window_id
             })
             .cloned()
@@ -1270,7 +1318,8 @@ impl State {
         self.x11_windows
             .iter()
             .find(|window| {
-                self.server_id_for(window) == selected.server_id
+                window.alive()
+                    && self.server_id_for(window) == selected.server_id
                     && window.window_id() == selected.window_id
             })
             .cloned()
@@ -1603,6 +1652,21 @@ impl State {
         }
     }
 
+    fn keyboard_focus_is_x11_window(&self, xwm_id: XwmId, window_id: u32) -> bool {
+        self.keyboard_focus.as_ref().is_some_and(|focus| {
+            matches!(
+                focus,
+                KeyboardFocusTarget::X11(window)
+                    if x11_window_identity_matches(
+                        window.xwm_id(),
+                        window.window_id(),
+                        xwm_id,
+                        window_id,
+                    )
+            )
+        })
+    }
+
     /// Focus a native Wayland surface only when Steam's X11 policy has no
     /// target. If the surface already belongs to a tracked X11 window, retain
     /// the wrapper that implements the client's ICCCM input model.
@@ -1636,9 +1700,10 @@ impl State {
     }
 
     fn clear_early_x11_focus(&mut self, window: &X11Surface) {
-        if self.keyboard_focus.as_ref().is_some_and(
-            |focus| matches!(focus, KeyboardFocusTarget::X11(focused) if focused == window),
-        ) {
+        if window
+            .xwm_id()
+            .is_some_and(|xwm_id| self.keyboard_focus_is_x11_window(xwm_id, window.window_id()))
+        {
             self.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
             // The selected X11 window itself may be unchanged, but Smithay's
             // leave cleared Xwayland's core focus. Force apply_x11_focus to
@@ -2467,9 +2532,7 @@ impl XWaylandShellHandler for State {
     }
 
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, window: X11Surface) {
-        if !self.x11_windows.contains(&window) {
-            self.x11_windows.push(window.clone());
-        }
+        self.remember_x11_window(&window);
         self.track_x11_window(&window);
         // X11 mapping and focus may precede xwayland-shell association. The
         // first enter then has no wl_surface to notify, so re-enter now that
@@ -2487,16 +2550,12 @@ impl XwmHandler for State {
     }
 
     fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if !self.x11_windows.contains(&window) {
-            self.x11_windows.push(window.clone());
-        }
+        self.remember_x11_window(&window);
         self.track_x11_window(&window);
     }
 
     fn new_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if !self.x11_windows.contains(&window) {
-            self.x11_windows.push(window.clone());
-        }
+        self.remember_x11_window(&window);
         self.track_x11_window(&window);
     }
 
@@ -2508,9 +2567,7 @@ impl XwmHandler for State {
         }
         let _ = window.set_fullscreen(true);
         let _ = window.set_mapped(true);
-        if !self.x11_windows.contains(&window) {
-            self.x11_windows.push(window.clone());
-        }
+        self.remember_x11_window(&window);
         self.track_x11_window(&window);
     }
 
@@ -2523,15 +2580,13 @@ impl XwmHandler for State {
     }
 
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if !self.x11_windows.contains(&window) {
-            self.x11_windows.push(window.clone());
-        }
+        self.remember_x11_window(&window);
         self.track_x11_window(&window);
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 
-    fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        let was_focused = window.wl_surface() == self.focused_surface;
+    fn unmapped_window(&mut self, xwm: XwmId, window: X11Surface) {
+        let was_focused = self.keyboard_focus_is_x11_window(xwm, window.window_id());
         if !window.is_override_redirect() {
             let _ = window.set_mapped(false);
         }
@@ -2541,27 +2596,24 @@ impl XwmHandler for State {
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 
-    fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        if window.wl_surface() == self.focused_surface {
+    fn destroyed_window(&mut self, xwm: XwmId, window: X11Surface) {
+        let window_id = window.window_id();
+        if self.keyboard_focus_is_x11_window(xwm, window_id) {
             self.set_keyboard_focus(None, SERIAL_COUNTER.next_serial());
         }
-        let server_id = self.server_id_for(&window);
-        if let Some(xwm_id) = window.xwm_id() {
-            self.x11_window_metadata
-                .remove(&(xwm_id, window.window_id()));
-            self.x11_window_sequences
-                .remove(&(xwm_id, window.window_id()));
-        }
-        self.content_overrides
-            .remove(&(server_id, window.window_id()));
+        let server_id = self.xwayland_server_ids.get(&xwm).copied().unwrap_or(0);
+        self.x11_window_metadata.remove(&(xwm, window_id));
+        self.x11_window_sequences.remove(&(xwm, window_id));
+        self.content_overrides.remove(&(server_id, window_id));
         self.content_override_parents
             .retain(|(candidate, raw), parent| {
-                !(*candidate == server_id
-                    && (*raw == window.window_id() || *parent == window.window_id()))
+                !(*candidate == server_id && (*raw == window_id || *parent == window_id))
             });
         self.content_override_pending
-            .remove(&(server_id, window.window_id()));
-        self.x11_windows.retain(|candidate| candidate != &window);
+            .remove(&(server_id, window_id));
+        self.x11_windows.retain(|candidate| {
+            !x11_window_identity_matches(candidate.xwm_id(), candidate.window_id(), xwm, window_id)
+        });
         self.refresh_focus(SERIAL_COUNTER.next_serial());
     }
 
@@ -2705,6 +2757,7 @@ impl SeatHandler for State {
                         ctx,
                         &[
                             perfetto::EventField::Window(u64::from(window.window_id())),
+                            perfetto::EventField::SurfaceAlive(window.alive()),
                             perfetto::EventField::SurfaceAssociated(window.wl_surface().is_some()),
                         ],
                     )
@@ -2760,7 +2813,7 @@ mod tests {
 
     use super::{
         LayerRenderElement, OutputConfig, State, vt_from_pressed_evdev_keys,
-        x11_property_changes_input_mode,
+        x11_property_changes_input_mode, x11_window_identity_matches,
     };
     use smithay::xwayland::xwm::WmWindowProperty;
     use wayland_server::Display;
@@ -2852,6 +2905,41 @@ mod tests {
         assert!(x11_property_changes_input_mode(WmWindowProperty::Hints));
         assert!(x11_property_changes_input_mode(WmWindowProperty::Protocols));
         assert!(!x11_property_changes_input_mode(WmWindowProperty::Title));
+    }
+
+    #[test]
+    fn x11_window_identity_is_independent_of_wrapper_liveness() {
+        #[derive(Clone, Copy)]
+        struct TrackedWindow {
+            xwm_id: Option<u8>,
+            window_id: u32,
+            alive: bool,
+        }
+
+        let mut windows = vec![
+            TrackedWindow {
+                xwm_id: Some(1),
+                window_id: 42,
+                alive: false,
+            },
+            TrackedWindow {
+                xwm_id: Some(1),
+                window_id: 43,
+                alive: true,
+            },
+            TrackedWindow {
+                xwm_id: Some(2),
+                window_id: 42,
+                alive: true,
+            },
+        ];
+
+        windows.retain(|candidate| {
+            !x11_window_identity_matches(candidate.xwm_id, candidate.window_id, 1, 42)
+        });
+
+        assert_eq!(windows.len(), 2);
+        assert!(windows.iter().all(|candidate| candidate.alive));
     }
 
     #[test]
