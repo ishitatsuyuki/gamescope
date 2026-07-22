@@ -43,7 +43,7 @@ use smithay::{
                 utils::RescaleRenderElement,
             },
             gles::GlesRenderer,
-            utils::on_commit_buffer_handler,
+            utils::{Buffer as RendererBuffer, on_commit_buffer_handler},
         },
     },
     output::{Mode as OutputMode, Output, PhysicalProperties},
@@ -114,6 +114,9 @@ pub struct HardwareFrame {
     pub id: u64,
     pub layers: Vec<RenderLayer>,
     pub cursor: Option<CursorLayer>,
+    /// Buffers captured at the aligned latch. The worker keeps these alive
+    /// until it has transferred ownership to renderer/KMS state.
+    pub buffers: Vec<RendererBuffer>,
 }
 
 /// Events returned to the Wayland thread.
@@ -908,7 +911,15 @@ impl DrmRuntime {
                     }
                 );
             }
-            Err(FrameError::EmptyFrame) => {}
+            Err(FrameError::EmptyFrame) => {
+                // The frontend treats every submitted snapshot as in flight
+                // until the worker reports either a flip or a deferral.  An
+                // empty atomic frame has no page-flip event to clear that
+                // state, so acknowledge it explicitly.
+                let _ = self
+                    .events
+                    .send(HardwareEvent::FrameDeferred { frame_id: frame.id });
+            }
             Err(error) => {
                 let _ = self.events.send(HardwareEvent::Error(format!(
                     "DRM frame {} atomic commit failed: {error}",
@@ -1426,6 +1437,7 @@ mod tests {
             id,
             layers: Vec::new(),
             cursor: None,
+            buffers: Vec::new(),
         }
     }
 

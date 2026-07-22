@@ -37,7 +37,10 @@ use smithay::{
         renderer::{
             Renderer,
             element::{Element, Id, Kind, RenderElement, UnderlyingStorage},
-            utils::{CommitCounter, DamageSet, OpaqueRegions, on_commit_buffer_handler},
+            utils::{
+                Buffer as RendererBuffer, CommitCounter, DamageSet, OpaqueRegions,
+                RendererSurfaceStateUserData, on_commit_buffer_handler,
+            },
         },
     },
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_drm_syncobj,
@@ -532,6 +535,7 @@ pub struct State {
     dmabuf_node: Option<DrmNode>,
     frame_sequence: u64,
     pending_swapchain_commits: Vec<(WlSurface, CommitMetadata)>,
+    latched_buffers: HashMap<WlSurface, RendererBuffer>,
     pressed_keysyms: Vec<u32>,
     pressed_evdev_keys: HashSet<u32>,
     intercepted_vt_keys: HashSet<u32>,
@@ -680,6 +684,7 @@ impl State {
             dmabuf_node: None,
             frame_sequence: 0,
             pending_swapchain_commits: Vec::new(),
+            latched_buffers: HashMap::new(),
             pressed_keysyms: Vec::new(),
             pressed_evdev_keys: HashSet::new(),
             intercepted_vt_keys: HashSet::new(),
@@ -1795,7 +1800,12 @@ impl State {
             .iter()
             .rposition(|(pending_surface, _)| pending_surface == &surface)
         {
+            // Every older commit for this surface has been superseded by the
+            // one visible at this latch. Do not leave their timing metadata
+            // queued indefinitely when virtual/mailbox pacing skips them.
             let (_, commit) = self.pending_swapchain_commits.remove(index);
+            self.pending_swapchain_commits
+                .retain(|(pending_surface, _)| pending_surface != &surface);
             let present_time_ns = u64::try_from(at.as_nanos()).unwrap_or(u64::MAX);
             let refresh_cycle_ns = u64::try_from(refresh.as_nanos()).unwrap_or(u64::MAX);
             self.gamescope_state.surface_presented(
@@ -1807,6 +1817,49 @@ impl State {
                 refresh_cycle_ns,
             );
         }
+    }
+
+    /// Retain the buffers visible at this latch until the next latch replaces
+    /// them or an aligned latch promotes them into the scanout path.
+    pub fn latch_buffers(&mut self) {
+        let mut surfaces = self
+            .render_layers()
+            .into_iter()
+            .map(|layer| layer.surface)
+            .collect::<Vec<_>>();
+        if let Some(cursor) = self.cursor_layer() {
+            surfaces.push(cursor.surface);
+        }
+        surfaces.dedup();
+
+        let mut latched_buffers = HashMap::new();
+        for root in surfaces {
+            with_surface_tree_downward(
+                &root,
+                (),
+                |_, _, &()| TraversalAction::DoChildren(()),
+                |surface, states, &()| {
+                    let buffer = states
+                        .data_map
+                        .get::<RendererSurfaceStateUserData>()
+                        .and_then(|state| state.lock().ok()?.buffer().cloned());
+                    if let Some(buffer) = buffer {
+                        latched_buffers.insert(surface.clone(), buffer);
+                    }
+                },
+                |_, _, &()| true,
+            );
+        }
+        self.latched_buffers = latched_buffers;
+    }
+
+    /// Transfer the current virtual-latch ownership to the backend. The
+    /// backend must retain these buffers only until the real presentation (or
+    /// deferral) completes.
+    pub fn take_latched_buffers(&mut self) -> Vec<RendererBuffer> {
+        std::mem::take(&mut self.latched_buffers)
+            .into_values()
+            .collect()
     }
 
     /// Forward an absolute pointer position to the selected game surface.

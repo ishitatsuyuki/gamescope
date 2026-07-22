@@ -88,6 +88,7 @@ struct Options {
     keep_alive: bool,
     drm_device: Option<PathBuf>,
     output_refresh_millihz: Option<i32>,
+    virtual_refresh_multiplier: u32,
     direct_scanout: bool,
     adaptive_sync: bool,
     connector_priorities: Vec<String>,
@@ -225,6 +226,7 @@ impl Options {
             keep_alive: false,
             drm_device: None,
             output_refresh_millihz: None,
+            virtual_refresh_multiplier: 1,
             direct_scanout: true,
             adaptive_sync: false,
             connector_priorities: Vec::new(),
@@ -250,6 +252,9 @@ impl Options {
                 "--refresh" | "--nested-refresh" | "-r" => {
                     let hz: f64 = parse_value(&mut args, &arg)?;
                     options.output.refresh_millihz = hz_to_millihz(hz)?;
+                }
+                "--virtual-refresh-multiplier" => {
+                    options.virtual_refresh_multiplier = parse_value(&mut args, &arg)?;
                 }
                 "--socket" => options.socket = Some(next_value(&mut args, &arg)?),
                 "--no-xwayland" => options.xwayland_count = 0,
@@ -285,7 +290,7 @@ impl Options {
                 }
                 "--help" => {
                     println!(
-                        "gamescope-rs [--backend auto|nested|drm] [-n|--nested] [--drm] [--drm-device CARD] [-O CONNECTORS] [-w WIDTH] [-h HEIGHT] [-W OUTPUT_WIDTH] [-H OUTPUT_HEIGHT] [-r HZ] [--output-refresh HZ] [--adaptive-sync] [--disable-direct-scanout] [-b] [-f] [-e|--steam] [--xwayland-count N] [--expose-wayland] [--socket NAME] [-- COMMAND ...]"
+                        "gamescope-rs [--backend auto|nested|drm] [-n|--nested] [--drm] [--drm-device CARD] [-O CONNECTORS] [-w WIDTH] [-h HEIGHT] [-W OUTPUT_WIDTH] [-H OUTPUT_HEIGHT] [-r HZ] [--output-refresh HZ] [--virtual-refresh-multiplier N] [--adaptive-sync] [--disable-direct-scanout] [-b] [-f] [-e|--steam] [--xwayland-count N] [--expose-wayland] [--socket NAME] [-- COMMAND ...]"
                     );
                     std::process::exit(0);
                 }
@@ -306,6 +311,17 @@ impl Options {
         }
         if options.output.refresh_millihz <= 0 {
             return Err("refresh rate must be positive".into());
+        }
+        if options.virtual_refresh_multiplier == 0 {
+            return Err("virtual refresh multiplier must be positive".into());
+        }
+        if multiplied_refresh_millihz(
+            options.output.refresh_millihz,
+            options.virtual_refresh_multiplier,
+        )
+        .is_none()
+        {
+            return Err("multiplied virtual refresh rate is too large".into());
         }
         Ok(options)
     }
@@ -473,7 +489,8 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
     let output_config = options
         .output
         .resolved_for_output(i32::try_from(window_width)?, i32::try_from(window_height)?);
-    let mut state = State::new_with_steam(&handle, &output_config, options.steam);
+    let virtual_config = virtual_output_config(&output_config, options.virtual_refresh_multiplier);
+    let mut state = State::new_with_steam(&handle, &virtual_config, options.steam);
     let limiter_file = LimiterFile::create()?;
     state.set_limiter_file(limiter_file.path().to_owned());
     let mut event_loop = EventLoop::<State>::try_new()?;
@@ -579,6 +596,7 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
     let mut next_xwayland_server_id = u32::try_from(options.xwayland_count)?;
     let frame_due = Rc::new(Cell::new(true));
     let frame_due_at = Rc::new(Cell::new(Some(Instant::now())));
+    let latch_due = Rc::new(Cell::new(true));
     let winit_frame_due = Rc::clone(&frame_due);
     let winit_frame_due_at = Rc::clone(&frame_due_at);
     let winit_events = Rc::new(RefCell::new(VecDeque::new()));
@@ -607,12 +625,15 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 .borrow_mut()
                 .push_back((queued_at, event));
         })?;
-    let nested_refresh = Duration::from_nanos(
+    let physical_nested_refresh = Duration::from_nanos(
         1_000_000_000_000_u64
             / u64::try_from(output_config.refresh_millihz.max(1)).unwrap_or(60_000),
     );
+    let nested_refresh =
+        virtual_refresh_interval(physical_nested_refresh, options.virtual_refresh_multiplier);
     let timer_frame_due = Rc::clone(&frame_due);
     let timer_frame_due_at = Rc::clone(&frame_due_at);
+    let timer_latch_due = Rc::clone(&latch_due);
     event_loop.handle().insert_source(
         Timer::from_duration(nested_refresh),
         move |deadline, _, _state| {
@@ -630,6 +651,7 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
                 }
             );
             timer_frame_due.set(true);
+            timer_latch_due.set(true);
             if timer_frame_due_at.get().is_none() {
                 timer_frame_due_at.set(Some(fired_at));
             }
@@ -638,6 +660,9 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
     )?;
 
     info!(socket = socket_name, "Rust Gamescope compositor is ready");
+
+    let mut virtual_latch_index = 0_u32;
+    let mut presentation_sequence = 0_u64;
 
     loop {
         {
@@ -844,9 +869,29 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             }
         }
         display.flush_clients()?;
+        if !latch_due.replace(false) {
+            continue;
+        }
+        let aligned_latch = virtual_latch_index % options.virtual_refresh_multiplier == 0;
+        virtual_latch_index = virtual_latch_index.wrapping_add(1);
+        state.latch_buffers();
+        presentation_sequence = presentation_sequence.wrapping_add(1);
+        state.presented_with_metadata(
+            start.elapsed(),
+            nested_refresh,
+            presentation_sequence,
+            wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync,
+        );
+        display.flush_clients()?;
+        if !aligned_latch {
+            continue;
+        }
         if !frame_due.replace(false) {
             continue;
         }
+        // The nested backend has completed use of these buffers when submit
+        // returns. Do not leave aligned buffers retained as virtual candidates.
+        let _scanout_buffers = state.take_latched_buffers();
         let frame_ready_at = frame_due_at.take().unwrap_or_else(Instant::now);
         perfetto_sdk::scoped_track_event!(
             "gamescope.frame",
@@ -930,8 +975,6 @@ fn run_nested(options: Options) -> Result<(), Box<dyn Error>> {
             draw_render_elements(&mut frame, 1.0, &elements, &[damage])?;
             let _sync = frame.finish()?;
         }
-        state.presented(start.elapsed());
-        display.flush_clients()?;
         backend.submit(Some(&[damage]))?;
     }
 }
@@ -975,10 +1018,14 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     output_config.refresh_millihz = physical_output.refresh_millihz;
     let server_config = ServerConfig {
         pipewire_node_id: None,
-        active_display: Some(active_display_info(&physical_output)),
+        active_display: Some(active_display_info(
+            &physical_output,
+            options.virtual_refresh_multiplier,
+        )),
     };
+    let virtual_config = virtual_output_config(&output_config, options.virtual_refresh_multiplier);
     let mut state =
-        State::new_with_server_config(&handle, &output_config, options.steam, server_config);
+        State::new_with_server_config(&handle, &virtual_config, options.steam, server_config);
     state.set_dmabuf_node(DrmNode::from_dev_id(physical_output.device_id)?);
     state.enable_vt_switching();
     let limiter_file = LimiterFile::create()?;
@@ -1138,13 +1185,14 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
     let mut next_xwayland_server_id = u32::try_from(options.xwayland_count)?;
     let mut next_frame_id = 1_u64;
     let mut frame_in_flight = None::<u64>;
-    let mut repaint_at = Instant::now();
-    let mut idle_present_at = None::<Instant>;
+    let mut scanout_buffers = HashMap::new();
+    let mut next_latch_at = Instant::now();
+    let mut virtual_latch_phase = 0_u32;
     let mut last_scanout_status = None::<DirectScanoutStatus>;
     let mut output_asleep = false;
     let mut protocol_frame_intervals = [None::<Duration>; 2];
     let monotonic_clock = Clock::<Monotonic>::new();
-    let mut last_flip_time = None::<Duration>;
+    let mut next_virtual_present_time = None::<Duration>;
     let mut presentation_sequence = 0_u64;
 
     info!(
@@ -1158,13 +1206,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
 
     loop {
         let now = Instant::now();
-        let deadline = if idle_present_at.is_some() {
-            idle_present_at
-        } else if !output_asleep && frame_in_flight.is_none() {
-            Some(repaint_at)
-        } else {
-            None
-        };
+        let deadline = (!output_asleep).then_some(next_latch_at);
         let timeout = deadline.map(|deadline| deadline.saturating_duration_since(now));
         {
             let dispatch_started = Instant::now();
@@ -1347,6 +1389,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                     if frame_in_flight == Some(frame_id) {
                         frame_in_flight = None;
                     }
+                    scanout_buffers.remove(&frame_id);
                     if last_scanout_status != Some(scanout_status) {
                         info!(?scanout_status, "DRM primary-plane path changed");
                         state.publish_direct_scanout_status(scanout_status.code());
@@ -1359,31 +1402,45 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                         "DRM page flip completed"
                     );
                     let refresh = physical_refresh_interval(&physical_output);
-                    last_flip_time = Some(
-                        monotonic_time.unwrap_or_else(|| Duration::from(monotonic_clock.now())),
-                    );
-                    repaint_at = at
+                    let flip_time =
+                        monotonic_time.unwrap_or_else(|| Duration::from(monotonic_clock.now()));
+                    let virtual_refresh =
+                        virtual_refresh_interval(refresh, options.virtual_refresh_multiplier);
+                    let aligned_latch_at = at
                         + repaint_delay(
                             refresh,
                             protocol_frame_intervals[screen_slot(physical_output.screen)],
                         );
+                    (next_latch_at, virtual_latch_phase) = next_virtual_latch_after(
+                        Instant::now(),
+                        aligned_latch_at,
+                        virtual_refresh,
+                        options.virtual_refresh_multiplier,
+                    );
+                    next_virtual_present_time = Some(flip_time.saturating_add(virtual_refresh));
                 }
                 HardwareEvent::FrameDeferred { frame_id } => {
                     if frame_in_flight == Some(frame_id) {
                         frame_in_flight = None;
                     }
-                    idle_present_at =
-                        Some(Instant::now() + physical_refresh_interval(&physical_output));
+                    scanout_buffers.remove(&frame_id);
                 }
                 HardwareEvent::OutputChanged(output) => {
+                    scanout_buffers.clear();
                     physical_output = output;
                     output_asleep = false;
-                    state.publish_active_display(active_display_info(&physical_output));
+                    state.publish_active_display(active_display_info(
+                        &physical_output,
+                        options.virtual_refresh_multiplier,
+                    ));
                     let mut logical_output = options
                         .output
                         .resolved_for_output(physical_output.width, physical_output.height);
                     logical_output.refresh_millihz = physical_output.refresh_millihz;
-                    state.publish_output_mode(&logical_output);
+                    state.publish_output_mode(&virtual_output_config(
+                        &logical_output,
+                        options.virtual_refresh_multiplier,
+                    ));
                     state.publish_hardware_vrr(
                         physical_output.vrr_capable,
                         physical_output.vrr_enabled,
@@ -1394,50 +1451,75 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                             warn!(%error, "failed to update dma-buf feedback after hotplug");
                         }
                     }
-                    repaint_at = Instant::now();
+                    virtual_latch_phase = 0;
+                    next_latch_at = Instant::now();
+                    next_virtual_present_time = None;
                 }
                 HardwareEvent::OutputDisconnected => {
                     warn!("DRM output disconnected; waiting for hotplug");
                     frame_in_flight = None;
+                    scanout_buffers.clear();
                     output_asleep = true;
                 }
                 HardwareEvent::OutputPowerChanged { asleep } => {
                     output_asleep = asleep;
                     frame_in_flight = None;
-                    idle_present_at = None;
+                    scanout_buffers.clear();
                     if !asleep {
-                        repaint_at = Instant::now();
+                        virtual_latch_phase = 0;
+                        next_latch_at = Instant::now();
+                        next_virtual_present_time = None;
                     }
                 }
                 HardwareEvent::Error(message) => {
                     warn!(%message, "hardware compositor error");
                     frame_in_flight = None;
-                    repaint_at = Instant::now() + physical_refresh_interval(&physical_output);
+                    scanout_buffers.clear();
+                    virtual_latch_phase = 0;
+                    next_latch_at = Instant::now() + physical_refresh_interval(&physical_output);
+                    next_virtual_present_time = None;
                 }
             }
         }
 
         let now = Instant::now();
-        if idle_present_at.is_some_and(|deadline| now >= deadline) {
-            idle_present_at = None;
-            let refresh = physical_refresh_interval(&physical_output);
-            presentation_sequence = presentation_sequence.wrapping_add(1);
-            state.presented_with_metadata(
-                Duration::from(monotonic_clock.now()),
-                refresh,
-                presentation_sequence,
+        if !output_asleep && now >= next_latch_at {
+            let latch_deadline = next_latch_at;
+            let physical_refresh = physical_refresh_interval(&physical_output);
+            let virtual_refresh =
+                virtual_refresh_interval(physical_refresh, options.virtual_refresh_multiplier);
+            let aligned_latch = virtual_latch_phase == 0;
+            virtual_latch_phase = (virtual_latch_phase + 1) % options.virtual_refresh_multiplier;
+            next_latch_at = now + virtual_refresh;
+
+            state.latch_buffers();
+            let predicted_present_time = next_virtual_present_time.unwrap_or_else(|| {
+                Duration::from(monotonic_clock.now()).saturating_add(virtual_refresh)
+            });
+            next_virtual_present_time =
+                Some(predicted_present_time.saturating_add(virtual_refresh));
+            let mut presentation_kind =
                 wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
-                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock,
-            );
-            repaint_at = now;
-        }
-        if !output_asleep
-            && frame_in_flight.is_none()
-            && idle_present_at.is_none()
-            && now >= repaint_at
-        {
+                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock;
+            if aligned_latch {
+                presentation_kind |= wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::ZeroCopy;
+            }
+            presentation_sequence = presentation_sequence.wrapping_add(1);
+
+            if !aligned_latch || frame_in_flight.is_some() {
+                state.presented_with_metadata(
+                    predicted_present_time,
+                    virtual_refresh,
+                    presentation_sequence,
+                    presentation_kind,
+                );
+                display.flush_clients()?;
+                continue;
+            }
             let frame_id = next_frame_id;
             next_frame_id = next_frame_id.wrapping_add(1);
+            let latched_buffers = state.take_latched_buffers();
+            scanout_buffers.insert(frame_id, latched_buffers.clone());
             perfetto_sdk::scoped_track_event!(
                 "gamescope.frame",
                 "DRM latch and publish frame",
@@ -1447,7 +1529,7 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                         &[
                             EventField::FrameId(frame_id),
                             EventField::RepaintLateNs(duration_ns(
-                                now.saturating_duration_since(repaint_at),
+                                now.saturating_duration_since(latch_deadline),
                             )),
                         ],
                     );
@@ -1457,29 +1539,17 @@ fn run_drm(options: Options) -> Result<(), Box<dyn Error>> {
                 id: frame_id,
                 layers: state.render_layers(),
                 cursor: state.cursor_layer(),
+                buffers: latched_buffers,
             }) {
                 debug!(replaced, frame_id, "coalesced obsolete DRM frame");
+                scanout_buffers.remove(&replaced);
             }
-            // Gamescope intentionally releases PresentWait at the latest
-            // useful latch point and reports the predicted next display time.
-            // Waiting for the page-flip completion here costs an entire frame
-            // of application backpressure, especially at high refresh rates.
-            let refresh = physical_refresh_interval(&physical_output);
-            let interval = presentation_interval(
-                refresh,
-                protocol_frame_intervals[screen_slot(physical_output.screen)],
-            );
-            let predicted_present_time = last_flip_time
-                .map(|last_flip| last_flip.saturating_add(interval))
-                .unwrap_or_else(|| Duration::from(monotonic_clock.now()).saturating_add(refresh));
-            let presentation_kind =
-                wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::Vsync
-                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::HwClock
-                    | wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::ZeroCopy;
-            presentation_sequence = presentation_sequence.wrapping_add(1);
+            // Release frame callbacks and presentation waits immediately after
+            // the aligned image has been handed to the KMS worker. The worker
+            // and scanout path retain their own references to the image.
             state.presented_with_metadata(
                 predicted_present_time,
-                interval,
+                virtual_refresh,
                 presentation_sequence,
                 presentation_kind,
             );
@@ -1686,6 +1756,22 @@ fn physical_refresh_interval(output: &HardwareOutputInfo) -> Duration {
         })
 }
 
+fn multiplied_refresh_millihz(refresh_millihz: i32, multiplier: u32) -> Option<i32> {
+    i32::try_from(i64::from(refresh_millihz).checked_mul(i64::from(multiplier))?).ok()
+}
+
+fn virtual_refresh_interval(physical: Duration, multiplier: u32) -> Duration {
+    let nanos = physical.as_nanos() / u128::from(multiplier.max(1));
+    Duration::from_nanos(u64::try_from(nanos.max(1)).unwrap_or(u64::MAX))
+}
+
+fn virtual_output_config(config: &OutputConfig, multiplier: u32) -> OutputConfig {
+    let mut virtual_config = config.clone();
+    virtual_config.refresh_millihz =
+        multiplied_refresh_millihz(config.refresh_millihz, multiplier).unwrap_or(i32::MAX);
+    virtual_config
+}
+
 fn screen_slot(screen: ScreenType) -> usize {
     match screen {
         ScreenType::Internal => 0,
@@ -1703,11 +1789,47 @@ fn repaint_delay(refresh: Duration, frame_limit: Option<Duration>) -> Duration {
     target.saturating_sub(refresh.mul_f64(0.4))
 }
 
+/// Return the first virtual latch strictly after `now`, with phase zero
+/// denoting the latch which commits for the next physical refresh.
+///
+/// Page-flip events are delivered after scanout has started. With multipliers
+/// above two, the earliest virtual latch belonging to the following physical
+/// cycle can therefore already be in the past by the time the event is
+/// handled. Installing that expired deadline makes the DRM loop repeatedly
+/// dispatch with a zero timeout. Skip expired slots while preserving phase.
+fn next_virtual_latch_after(
+    now: Instant,
+    aligned_at: Instant,
+    virtual_refresh: Duration,
+    multiplier: u32,
+) -> (Instant, u32) {
+    let multiplier = multiplier.max(1);
+    if multiplier == 1 {
+        return if aligned_at > now {
+            (aligned_at, 0)
+        } else {
+            (now + virtual_refresh, 0)
+        };
+    }
+
+    let mut phase = 1;
+    let mut deadline = aligned_at
+        .checked_sub(virtual_refresh.saturating_mul(multiplier - 1))
+        .unwrap_or(now);
+    while deadline <= now {
+        deadline = deadline
+            .checked_add(virtual_refresh)
+            .unwrap_or_else(|| now + virtual_refresh);
+        phase = (phase + 1) % multiplier;
+    }
+    (deadline, phase)
+}
+
 fn presentation_interval(refresh: Duration, frame_limit: Option<Duration>) -> Duration {
     frame_limit.map_or(refresh, |limit| limit.max(refresh))
 }
 
-fn active_display_info(output: &HardwareOutputInfo) -> ActiveDisplayInfo {
+fn active_display_info(output: &HardwareOutputInfo, multiplier: u32) -> ActiveDisplayInfo {
     let mut flags = u32::from(output.screen == ScreenType::Internal);
     if output.vrr_capable {
         flags |= 0x4;
@@ -1717,7 +1839,11 @@ fn active_display_info(output: &HardwareOutputInfo) -> ActiveDisplayInfo {
         display_make: output.display_make.clone(),
         display_model: output.display_model.clone(),
         flags,
-        valid_refresh_rates_hz: output.valid_refresh_rates_hz.clone(),
+        valid_refresh_rates_hz: output
+            .valid_refresh_rates_hz
+            .iter()
+            .map(|refresh| refresh.saturating_mul(multiplier))
+            .collect(),
     }
 }
 
@@ -1744,11 +1870,14 @@ fn centered_origin(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use gamescope_core::control::{RefreshCycleOverride, ScreenType};
 
-    use super::{Options, refresh_limit_interval, repaint_delay};
+    use super::{
+        Options, multiplied_refresh_millihz, next_virtual_latch_after, refresh_limit_interval,
+        repaint_delay, virtual_output_config, virtual_refresh_interval,
+    };
 
     #[test]
     fn steam_and_multi_xwayland_options_are_not_noops() {
@@ -1768,6 +1897,62 @@ mod tests {
         let options = Options::parse_from(["--no-xwayland"].into_iter().map(str::to_owned))
             .expect("valid no-Xwayland option");
         assert_eq!(options.xwayland_count, 0);
+    }
+
+    #[test]
+    fn virtual_refresh_multiplier_is_validated_and_defaults_to_one() {
+        let defaults = Options::parse_from(std::iter::empty()).expect("default options");
+        assert_eq!(defaults.virtual_refresh_multiplier, 1);
+
+        let options = Options::parse_from(
+            ["--virtual-refresh-multiplier", "4"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect("valid virtual refresh multiplier");
+        assert_eq!(options.virtual_refresh_multiplier, 4);
+
+        let error = Options::parse_from(
+            ["--virtual-refresh-multiplier", "0"]
+                .into_iter()
+                .map(str::to_owned),
+        )
+        .expect_err("a zero multiplier must fail");
+        assert!(error.contains("must be positive"));
+    }
+
+    #[test]
+    fn virtual_refresh_multiplies_metadata_and_divides_latch_interval() {
+        let physical = gamescope_compositor::OutputConfig {
+            width: 1280,
+            height: 800,
+            refresh_millihz: 60_000,
+        };
+        let virtual_config = virtual_output_config(&physical, 3);
+        assert_eq!(virtual_config.refresh_millihz, 180_000);
+        assert_eq!(multiplied_refresh_millihz(60_000, 3), Some(180_000));
+        assert_eq!(
+            virtual_refresh_interval(Duration::from_millis(15), 3),
+            Duration::from_millis(5)
+        );
+    }
+
+    #[test]
+    fn drm_virtual_latch_reanchor_skips_expired_slots_without_losing_phase() {
+        let now = Instant::now();
+        let virtual_refresh = Duration::from_millis(4);
+        // For a 4x multiplier the first two slots of the next physical cycle
+        // have already elapsed when the page-flip event is processed.
+        let aligned_at = now + Duration::from_millis(6);
+        let (deadline, phase) = next_virtual_latch_after(now, aligned_at, virtual_refresh, 4);
+        assert_eq!(deadline, now + Duration::from_millis(2));
+        assert_eq!(phase, 3);
+        assert!(deadline > now);
+
+        let (deadline, phase) =
+            next_virtual_latch_after(now, now - Duration::from_millis(1), virtual_refresh, 1);
+        assert_eq!(deadline, now + virtual_refresh);
+        assert_eq!(phase, 0);
     }
 
     #[test]
